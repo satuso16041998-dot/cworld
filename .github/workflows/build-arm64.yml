@@ -1,0 +1,43 @@
+
+name: Cube World ARM64 Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config cmake clang \
+            libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev \
+            libxcursor-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Compile ARM64
+        run: |
+          cargo build --release -p cw-client -p cw-server
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/release/cw-client dist/
+          cp target/release/cw-server dist/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: CubeWorld-ARM64
+          path: dist/
