@@ -1,12 +1,14 @@
 
-name: Cube World ARM64 Build
+name: Cube World ARM64 (muOS glibc compatible)
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
 
     steps:
       - name: Download source
@@ -16,39 +18,50 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            libdbus-1-dev \
-            cmake \
-            clang \
-            libasound2-dev \
-            libudev-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libx11-dev \
-            libxrandr-dev \
-            libxcursor-dev \
-            libxi-dev \
-            libgl1-mesa-dev \
-            libegl1-mesa-dev
+            build-essential pkg-config libdbus-1-dev cmake clang \
+            libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev binutils
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: Compile ARM64
+        run: cargo build --release -p cw-client -p cw-server
+
+      - name: Verify ARM64 and glibc compatibility
         run: |
-          cargo build --release \
-            -p cw-client \
-            -p cw-server
+          file target/release/cw-client target/release/cw-server
+          python3 - <<'PYGLIBC'
+          import re, subprocess, sys
+          for binary in ('cw-client', 'cw-server'):
+              out = subprocess.check_output(
+                  ['readelf', '--version-info', 'target/release/' + binary],
+                  text=True
+              )
+              found = [
+                  tuple(map(int, x))
+                  for x in re.findall(r'GLIBC_(\d+)\.(\d+)', out)
+              ]
+              latest = max(found, default=(0,0))
+              print(f'{binary}: max required glibc {latest[0]}.{latest[1]}')
+              if latest > (2,38):
+                  sys.exit(
+                      f'{binary} requires glibc newer than muOS 2.38'
+                  )
+          PYGLIBC
 
       - name: Package binaries
         run: |
           mkdir -p dist
           cp target/release/cw-client dist/
           cp target/release/cw-server dist/
+          chmod 755 dist/cw-client dist/cw-server
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: CubeWorld-ARM64
+          name: CubeWorld-ARM64-muOS
           path: dist/
+          if-no-files-found: error
