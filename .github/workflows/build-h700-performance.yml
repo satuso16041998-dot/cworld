@@ -1,0 +1,133 @@
+name: Cube World H700 Performance
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libdbus-1-dev cmake clang \
+            libasound2-dev libudev-dev \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev binutils
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Apply muOS GLES Wayland fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def patch(path, old, new):
+              p = Path(path)
+              src = p.read_text()
+              count = src.count(old)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one patch location, got {count}. Repository changed?')
+              p.write_text(src.replace(old, new, 1))
+              print(f'Patched: {path}')
+
+          patch('crates/cw-render/Cargo.toml',
+                'wgpu = "30.0.1"\n',
+                'wgpu = "30.0.1"\nwinit = "0.30.13"\n')
+
+          patch('crates/cw-render/src/gpu/device.rs',
+                '''    ) -> Result<Self, GpuError> {
+                  let instance = create_instance();
+                  let surface = instance.create_surface(target).map_err(GpuError::Surface)?;''',
+                '''    ) -> Result<Self, GpuError> {
+                  Self::new_with_instance(target, width, height, vsync, create_instance())
+              }
+
+              /// GLES/Wayland requires the display handle when the wgpu instance is created.
+              /// Other backends can use it as well; WGPU_BACKEND still overrides the default.
+              pub fn new_with_display(
+                  target: impl Into<wgpu::SurfaceTarget<'w>>,
+                  width: u32,
+                  height: u32,
+                  vsync: bool,
+                  display: winit::event_loop::OwnedDisplayHandle,
+              ) -> Result<Self, GpuError> {
+                  let mut desc = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display));
+                  desc.backends = default_backends();
+                  Self::new_with_instance(target, width, height, vsync, wgpu::Instance::new(desc.with_env()))
+              }
+
+              fn new_with_instance(
+                  target: impl Into<wgpu::SurfaceTarget<'w>>,
+                  width: u32,
+                  height: u32,
+                  vsync: bool,
+                  instance: wgpu::Instance,
+              ) -> Result<Self, GpuError> {
+                  let surface = instance.create_surface(target).map_err(GpuError::Surface)?;''')
+
+          patch('crates/cw-render/src/gpu/device.rs',
+                '    } else if cfg!(any(target_os = "windows", target_os = "linux")) {',
+                '''    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+                      wgpu::Backends::GL
+                  } else if cfg!(any(target_os = "windows", target_os = "linux")) {''')
+
+          patch('crates/cw-client/src/app.rs',
+                'pub fn new(window: Arc<Window>) -> Result<ExecSink, String> {',
+                'pub fn new(window: Arc<Window>, display: winit::event_loop::OwnedDisplayHandle) -> Result<ExecSink, String> {')
+          patch('crates/cw-client/src/app.rs',
+                'let ctx = GpuContext::new(window, size.width, size.height, false).map_err(|e| e.to_string())?;',
+                'let ctx = GpuContext::new_with_display(window, size.width, size.height, false, display).map_err(|e| e.to_string())?;')
+          patch('crates/cw-client/src/app.rs',
+                'match ExecSink::new(Arc::clone(&window)) {',
+                'match ExecSink::new(Arc::clone(&window), el.owned_display_handle()) {')
+          root = Path('crates/cw-render/src/gpu/shaders')
+          patch(root / 'ps01_world.wgsl', 'return vec4<f32>(rgb, ps.alpha.x);', 'return vec4<f32>(c, ps.alpha.x);')
+          patch(root / 'ps03_water.wgsl', 'let lit = in.color.z * base + spec;', 'let lit = in.color.z * base;')
+          patch(root / 'ps05_clouds.wgsl', 'return f * (sky - in.color) + in.color;', 'discard; return vec4<f32>(0.0);')
+          patch('crates/cw-client/src/app.rs', 'sink.set_anti_aliasing(o.anti_aliasing);', 'sink.set_anti_aliasing(0);')
+          patch('crates/cw-client/src/app.rs', 'Some((rx, ry)) if rx > 0 && ry > 0 => (f64::from(physical.0) / f64::from(rx)).min(f64::from(physical.1) / f64::from(ry)),', 'Some((rx, ry)) if rx > 0 && ry > 0 => (f64::from(physical.0) / f64::from(rx.max(960))).min(f64::from(physical.1) / f64::from(ry.max(720))),')
+          PY
+
+      - name: Build Cube World for aarch64
+        env:
+          RUSTFLAGS: "-C target-cpu=cortex-a53"
+        run: cargo build --release -p cw-client -p cw-server
+
+      - name: Verify ELF architecture and required GLIBC
+        run: |
+          file target/release/cw-client target/release/cw-server
+          python3 - <<'PY'
+          import re, subprocess, sys
+          for binary in ('cw-client', 'cw-server'):
+              out = subprocess.check_output(['readelf','--version-info',f'target/release/{binary}'], text=True)
+              versions = [tuple(map(int,v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+)',out) if v]
+              latest = max(versions, default=(0,0))
+              print(f'{binary}: GLIBC {latest[0]}.{latest[1]}')
+              if latest > (2,38):
+                  sys.exit(f'{binary}: GLIBC too new for target compatibility check')
+          PY
+
+      - name: Prepare binaries
+        run: |
+          mkdir -p dist
+          cp target/release/cw-client dist/cw-client-h700
+          cp target/release/cw-server dist/cw-server
+          chmod 755 dist/*
+
+      - name: Upload ARM64 GLES test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: CubeWorld-H700-Performance
+          path: dist/
+          if-no-files-found: error
