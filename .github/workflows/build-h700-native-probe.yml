@@ -1,0 +1,40 @@
+name: Cube World H700 Native GPU Probe
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake clang libegl1-mesa-dev libgl1-mesa-dev libwayland-dev libxkbcommon-dev libx11-dev libasound2-dev libudev-dev libdbus-1-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build native EGL probe
+        env:
+          RUSTFLAGS: '-C target-cpu=cortex-a53'
+        run: |
+          mkdir -p crates/cw-render/examples
+          cat > crates/cw-render/examples/h700_native_probe.rs <<'RS'
+          fn main() {
+              eprintln!("Starting wgpu headless GLES probe");
+              let Some((_instance, adapter, device, _queue)) = cw_render::gpu::device::headless() else {
+                  eprintln!("No compatible adapter/device");
+                  std::process::exit(2);
+              };
+              eprintln!("Adapter: {:?}", adapter.get_info());
+              eprintln!("Limits: {:?}", device.limits());
+              eprintln!("Features: {:?}", device.features());
+              eprintln!("WGPU_DEVICE_OK");
+          }
+          RS
+          cargo build --release -p cw-render --example h700_native_probe
+          mkdir -p dist
+          cp target/release/examples/h700_native_probe dist/
+          sha256sum dist/h700_native_probe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: H700-Native-GPU-Probe
+          path: dist/
