@@ -1,0 +1,47 @@
+name: H700 SDL GLES triangle and HAL inspection
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libgles2-mesa-dev
+      - name: Build native triangle
+        run: |
+          mkdir -p dist
+          cat > /tmp/probe.c <<'C'
+          #include <SDL2/SDL.h>
+          #include <GLES3/gl3.h>
+          #include <stdio.h>
+          static GLuint shader(GLenum type,const char *src){
+            GLuint s=glCreateShader(type); glShaderSource(s,1,&src,0); glCompileShader(s);
+            GLint ok; glGetShaderiv(s,GL_COMPILE_STATUS,&ok); if(!ok){char b[2048];glGetShaderInfoLog(s,sizeof b,0,b);fprintf(stderr,"shader: %s\n",b);return 0;}return s;
+          }
+          int main(void){
+            setvbuf(stdout,0,_IONBF,0);
+            if(SDL_Init(SDL_INIT_VIDEO)<0){puts(SDL_GetError());return 1;}
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3); SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,0);
+            SDL_Window *w=SDL_CreateWindow("H700 GPU probe",0,0,640,480,SDL_WINDOW_OPENGL|SDL_WINDOW_FULLSCREEN);
+            if(!w){puts(SDL_GetError());return 2;} SDL_GLContext c=SDL_GL_CreateContext(w);
+            if(!c){puts(SDL_GetError());return 3;}
+            printf("SDL=%s\nGL_RENDERER=%s\nGL_VERSION=%s\n",SDL_GetCurrentVideoDriver(),glGetString(GL_RENDERER),glGetString(GL_VERSION));
+            GLuint v=shader(GL_VERTEX_SHADER,"#version 300 es\nconst vec2 p[3]=vec2[3](vec2(-.8,-.8),vec2(.8,-.8),vec2(0.,.8));void main(){gl_Position=vec4(p[gl_VertexID],0.,1.);}");
+            GLuint f=shader(GL_FRAGMENT_SHADER,"#version 300 es\nprecision mediump float;out vec4 color;void main(){color=vec4(1.,.2,.5,1.);}");
+            if(!v||!f)return 4; GLuint p=glCreateProgram();glAttachShader(p,v);glAttachShader(p,f);glLinkProgram(p);GLint ok;glGetProgramiv(p,GL_LINK_STATUS,&ok);if(!ok)return 5;
+            GLuint vao;glGenVertexArrays(1,&vao);glBindVertexArray(vao);glUseProgram(p);int x,y;SDL_GL_GetDrawableSize(w,&x,&y);glViewport(0,0,x,y);
+            Uint32 start=SDL_GetTicks(); unsigned frames=0; while(SDL_GetTicks()-start<5000){SDL_Event e;while(SDL_PollEvent(&e)){}glClearColor(.02,.03,.09,1);glClear(GL_COLOR_BUFFER_BIT);glDrawArrays(GL_TRIANGLES,0,3);if(!frames){unsigned char pixel[4];glReadPixels(x/2,y/2,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel);printf("PIXEL=%u,%u,%u,%u GL_ERROR=%x\n",pixel[0],pixel[1],pixel[2],pixel[3],glGetError());}SDL_GL_SwapWindow(w);frames++;}
+            printf("FRAMES=%u\nTRIANGLE_DONE\n",frames);SDL_GL_DeleteContext(c);SDL_DestroyWindow(w);SDL_Quit();return 0;
+          }
+          C
+          cc -O2 -mcpu=cortex-a53 /tmp/probe.c -o dist/h700_sdl_triangle $(pkg-config --cflags --libs sdl2) -lGLESv2
+      - name: Inspect exact HAL integration API
+        run: |
+          cargo fetch --locked || cargo fetch
+          find "$HOME/.cargo/registry/src" -path '*/wgpu-hal-*/src/gles/*.rs' -print > dist/hal_files.txt
+          while IFS= read -r f; do grep -n -A 30 -B 8 -E 'pub (unsafe )?fn (new_external|from_external|from_hal|new_external_context)' "$f" && echo "$f"; done < dist/hal_files.txt > dist/hal_api.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: H700-SDL-Triangle
+          path: dist/
