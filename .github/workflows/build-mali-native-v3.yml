@@ -1,0 +1,80 @@
+name: Cube World Mali Native Probe V3
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libegl1-mesa-dev libgl1-mesa-dev pkg-config build-essential
+      - name: Build external GLES probe
+        run: |
+          mkdir -p /tmp/mali-probe/src dist
+          cd /tmp/mali-probe
+          cat > Cargo.toml <<'TOML'
+          [package]
+          name = "h700_mali_probe_v3"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          wgpu = { version = "=30.0.1", default-features = false, features = ["gles", "wgsl"] }
+          wgpu-hal = { version = "=30.0.2", features = ["gles"] }
+          pollster = "0.4"
+          sdl2 = "0.38"
+          TOML
+          cat > src/main.rs <<'RS'
+          fn main() {
+              let sdl = sdl2::init().unwrap();
+              let video = sdl.video().unwrap();
+              let attr = video.gl_attr();
+              attr.set_context_profile(sdl2::video::GLProfile::GLES);
+              attr.set_context_version(3, 0);
+              let window = video.window("Mali wgpu probe", 640, 480).opengl().fullscreen().build().unwrap();
+              let context = window.gl_create_context().unwrap();
+              window.gl_make_current(&context).unwrap();
+              eprintln!("SDL driver: {}", video.current_video_driver());
+              let exposed = unsafe { wgpu_hal::gles::Adapter::new_external(
+                  |name| video.gl_get_proc_address(name) as *const std::ffi::c_void,
+                  Default::default(),
+              ) }.expect("external adapter failed");
+              eprintln!("EXTERNAL_ADAPTER_OK: {:?}", exposed.info);
+              let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+              let adapter = unsafe { instance.create_adapter_from_hal(exposed) };
+              eprintln!("WGPU_ADAPTER: {:?}", adapter.get_info());
+              let limits = adapter.limits();
+              eprintln!("SUPPORTED_LIMITS: {:?}", limits);
+              eprintln!("SUPPORTED_FEATURES: {:?}", adapter.features());
+              let desc = wgpu::DeviceDescriptor {
+                  required_limits: limits,
+                  ..Default::default()
+              };
+              let (device, queue) = pollster::block_on(adapter.request_device(&desc)).expect("request_device failed");
+              eprintln!("WGPU_DEVICE_OK");
+              let tex = device.create_texture(&wgpu::TextureDescriptor {
+                  label: Some("Mali test"), size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+                  mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                  format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+              });
+              let view = tex.create_view(&Default::default());
+              let mut encoder = device.create_command_encoder(&Default::default());
+              {
+                  let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                      color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                          view: &view, depth_slice: None, resolve_target: None,
+                          ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.2, b: 0.5, a: 1.0 }), store: wgpu::StoreOp::Store },
+                      })], ..Default::default()
+                  });
+              }
+              queue.submit([encoder.finish()]);
+              device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
+              eprintln!("WGPU_RENDER_SUBMITTED_OK");
+              drop(view); drop(tex); drop(queue); drop(device); drop(adapter); drop(instance);
+              drop(context);
+          }
+          RS
+          RUSTFLAGS='-C target-cpu=cortex-a53' cargo build --release
+          cp target/release/h700_mali_probe_v3 "$GITHUB_WORKSPACE/dist/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: H700-Mali-Native-V3
+          path: dist/
