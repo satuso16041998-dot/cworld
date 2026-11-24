@@ -1,0 +1,307 @@
+name: Cube World Mali Native H700 V2
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libdbus-1-dev cmake clang libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxcursor-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev libsdl2-dev binutils
+      - name: Apply native client patch
+        run: |
+          cat > /tmp/mali.patch <<'PATCH_EOF'
+          --- a/crates/cw-render/src/gpu/device.rs
+          +++ b/crates/cw-render/src/gpu/device.rs
+          @@ -129,7 +129,7 @@
+               /// Queue.
+               pub queue: wgpu::Queue,
+               /// Window surface.
+          -    pub surface: wgpu::Surface<'w>,
+          +    pub surface: Option<wgpu::Surface<'w>>,
+               /// Current surface configuration.
+               pub config: wgpu::SurfaceConfiguration,
+               /// Non-sRGB format the surface texture is viewed and rendered as.
+          @@ -243,7 +243,15 @@
+                   surface.configure(&device, &config);
+                   let depth = create_depth_texture_ms(&device, config.width, config.height, 1);
+                   let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+          -        Ok(Self { instance, adapter, device, queue, surface, config, color_format, depth, depth_view, sample_count: 1, msaa_view: None, capture_requested: false, captured: None })
+          +        Ok(Self { instance, adapter, device, queue, surface: Some(surface), config, color_format, depth, depth_view, sample_count: 1, msaa_view: None, capture_requested: false, captured: None })
+          +    }
+          +
+          +    pub fn external(instance: wgpu::Instance, adapter: wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue, width: u32, height: u32) -> Self {
+          +        let color_format = wgpu::TextureFormat::Rgba8Unorm;
+          +        let config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, format: color_format, color_space: wgpu::SurfaceColorSpace::Auto, width, height, present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2, alpha_mode: wgpu::CompositeAlphaMode::Opaque, view_formats: vec![] };
+          +        let depth = create_depth_texture_ms(&device, width, height, 1);
+          +        let depth_view = depth.create_view(&Default::default());
+          +        Self { instance, adapter, device, queue, surface: None, config, color_format, depth, depth_view, sample_count: 1, msaa_view: None, capture_requested: false, captured: None }
+               }
+           
+               /// The non-sRGB colour format to build pipelines and render surfaces with.
+          @@ -259,7 +267,7 @@
+                   }
+                   self.config.width = width;
+                   self.config.height = height;
+          -        self.surface.configure(&self.device, &self.config);
+          +        self.surface.as_ref().unwrap().configure(&self.device, &self.config);
+                   self.create_targets();
+               }
+           
+          @@ -307,16 +315,16 @@
+               /// Acquire the next back buffer. `None` means skip this frame (timeout, occluded,
+               /// outdated or lost surface; the surface is reconfigured where that helps).
+               pub fn acquire(&mut self) -> Option<Frame> {
+          -        let texture = match self.surface.get_current_texture() {
+          +        let texture = match self.surface.as_ref().unwrap().get_current_texture() {
+                       wgpu::CurrentSurfaceTexture::Success(t) => t,
+                       wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                           // Use this one; reconfigure before the next.
+                           let frame = self.frame_from(t);
+          -                self.surface.configure(&self.device, &self.config);
+          +                self.surface.as_ref().unwrap().configure(&self.device, &self.config);
+                           return Some(frame);
+                       }
+                       wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+          -                self.surface.configure(&self.device, &self.config);
+          +                self.surface.as_ref().unwrap().configure(&self.device, &self.config);
+                           return None;
+                       }
+                       _ => return None,
+          --- a/crates/cw-client/Cargo.toml
+          +++ b/crates/cw-client/Cargo.toml
+          @@ -7,6 +7,11 @@
+           description = "Cube World Alpha client (Cube.exe): game controller, input, audio, networking"
+           
+           [dependencies]
+          +sdl2 = "0.38"
+          +wgpu = "=30.0.1"
+          +wgpu-hal = { version = "=30.0.2", features = ["gles"] }
+          +pollster = "0.4"
+          +gl = "0.14"
+           cw-formats = { path = "../cw-formats" }
+           cw-net = { path = "../cw-net" }
+           cw-render = { path = "../cw-render" }
+          --- a/crates/cw-client/src/main.rs
+          +++ b/crates/cw-client/src/main.rs
+          @@ -30,7 +30,7 @@
+           fn main() {
+               let args: Vec<String> = std::env::args().collect();
+               let a = app::parse_args(&args);
+          -    if let Err(e) = app::run(a) {
+          +    if let Err(e) = app::run_mali(a) {
+                   eprintln!("cw-client: {e}");
+                   std::process::exit(1);
+               }
+          --- a/crates/cw-render/src/gpu/shaders/ps01_world.wgsl
+          +++ b/crates/cw-render/src/gpu/shaders/ps01_world.wgsl
+          @@ -32,5 +32,5 @@
+               let shimmer = c * (cos(angle) * 0.3 + 1.0);
+               // cmp oC0.xyz, -shininess, r3, r0: -shininess >= 0 keeps the plain colour.
+               let rgb = select(shimmer, c, -ps.shininess.x >= 0.0);
+          -    return vec4<f32>(rgb, ps.alpha.x);
+          +    return vec4<f32>(c, ps.alpha.x);
+           }
+          --- a/crates/cw-render/src/gpu/shaders/ps03_water.wgsl
+          +++ b/crates/cw-render/src/gpu/shaders/ps03_water.wgsl
+          @@ -32,7 +32,7 @@
+           
+               let deep = saturate(1.0 + y);
+               let base = deep * vec3<f32>(0.0, -0.5, 0.0) + vec3<f32>(0.0, 0.6, 1.0);
+          -    let lit = in.color.z * base + spec;
+          +    let lit = in.color.z * base;
+           
+               let fogged = mix(lit, ps.fogColor.xyz, saturate(d3));
+               let to_sky = saturate((d3 - 0.5) + (d3 - 0.5));
+          --- a/crates/cw-client/src/app.rs
+          +++ b/crates/cw-client/src/app.rs
+          @@ -1095,3 +1095,118 @@
+                   assert_eq!(vk_of(KeyCode::Enter), Some(0x0d));
+               }
+           }
+          +
+          +
+          +struct MaliSink {
+          +    inner: ExecSink,
+          +    target: wgpu::Texture,
+          +    view: wgpu::TextureView,
+          +    read: wgpu::Buffer,
+          +    pixels: Vec<u8>,
+          +}
+          +impl FrameSink for MaliSink {
+          +    fn resize(&mut self, _: u32, _: u32) {}
+          +    fn render(&mut self, frame: &FrameCommands, mut r: FrameResources<'_>) {
+          +        let s = &mut self.inner;
+          +        crate::assets::upload(&s.ctx, &mut s.res, std::mem::take(&mut r.upload));
+          +        let mut frame = frame.clone();
+          +        use cw_render::frame::PassKind;
+          +        frame.passes.retain(|p| !matches!(p.kind, PassKind::Clouds | PassKind::Shadows | PassKind::Stars));
+          +        s.sync(&frame, &r);
+          +        let mut enc = s.ctx.device.create_command_encoder(&Default::default());
+          +        s.exec.encode(&s.ctx.device, &s.ctx.queue, &mut enc, cw_render::gpu::exec::FrameTarget::new(&self.view, &s.ctx.depth_view, 640, 480), &frame, &mut s.res);
+          +        enc.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, wgpu::TexelCopyBufferInfo { buffer: &self.read, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2560), rows_per_image: Some(480) } }, wgpu::Extent3d { width: 640, height: 480, depth_or_array_layers: 1 });
+          +        s.ctx.queue.submit([enc.finish()]);
+          +        self.read.map_async(wgpu::MapMode::Read, .., |_| {});
+          +        s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+          +        { let v = self.read.get_mapped_range(..).expect("readback"); self.pixels.copy_from_slice(&v); }
+          +        self.read.unmap();
+          +    }
+          +}
+          +
+          +pub fn run_mali(args: Args) -> Result<(), String> {
+          +    use sdl2::{event::Event, keyboard::Keycode, mouse::MouseButton as SMouse};
+          +    let sdl = sdl2::init()?;
+          +    let video = sdl.video()?;
+          +    let attr = video.gl_attr();
+          +    attr.set_context_profile(sdl2::video::GLProfile::GLES);
+          +    attr.set_context_version(3,0);
+          +    let window = video.window("Cube World Mali",640,480).opengl().fullscreen().build().map_err(|e|e.to_string())?;
+          +    let context = window.gl_create_context()?;
+          +    window.gl_make_current(&context)?;
+          +    gl::load_with(|n| video.gl_get_proc_address(n) as *const _);
+          +    let exposed = unsafe { wgpu_hal::gles::Adapter::new_external(|n| video.gl_get_proc_address(n) as *const _, Default::default()) }.ok_or("external adapter failed")?;
+          +    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+          +    let adapter = unsafe { instance.create_adapter_from_hal(exposed) };
+          +    eprintln!("MALI_ADAPTER {:?}", adapter.get_info());
+          +    let features = adapter.features() & (wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+          +    let (device,queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), required_features: features, ..Default::default() })).map_err(|e|e.to_string())?;
+          +    let ctx = GpuContext::external(instance,adapter,device,queue,640,480);
+          +    let exec = Executor::new(&ctx.device,&ctx.queue,ctx.color_format());
+          +    let res = Resources::new(&ctx.device,ctx.color_format());
+          +    let target = ctx.device.create_texture(&wgpu::TextureDescriptor { label: Some("native frame"), size: wgpu::Extent3d {width:640,height:480,depth_or_array_layers:1}, mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,usage:wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::COPY_SRC,view_formats:&[] });
+          +    let view = target.create_view(&Default::default());
+          +    let read = ctx.device.create_buffer(&wgpu::BufferDescriptor {label:Some("native readback"),size:640*480*4,usage:wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::MAP_READ,mapped_at_creation:false});
+          +    let mut sink = MaliSink {inner:ExecSink {ctx,exec,res,chunk_versions:Vec::new(), #[cfg(feature="debug-overlay")] overlay:Default::default()},target,view,read,pixels:vec![0;640*480*4]};
+          +    let mut c = Controller::new(default_game_dir(),[960,720],vec![(960,720)],args.server_flag,args.server_address);
+          +    c.options.anti_aliasing=0; c.options.render_distance=25;
+          +    c.set_back_buffer(640,480,2.0/3.0); c.on_resize(960,720);
+          +    let mut events=sdl.event_pump()?;
+          +    let mut last=Instant::now(); let mut tick=last; let mut count=0u32; let mut fps=0u32;
+          +    let mut free=true; let mut tex=0; let mut fbo=0;
+          +    unsafe { gl::GenTextures(1,&mut tex); gl::GenFramebuffers(1,&mut fbo); }
+          +    eprintln!("MALI_GAME_LOOP_OK");
+          +    while !c.quit {
+          +        let start=Instant::now();
+          +        let now_free=c.is_cursor_free();
+          +        if free!=now_free { free=now_free; sdl.mouse().set_relative_mouse_mode(!free); }
+          +        for event in events.poll_iter() {
+          +            match event {
+          +                Event::Quit{..}=>c.quit=true,
+          +                Event::MouseMotion{x,y,xrel,yrel,..}=>if free {c.on_mouse_move(x as f32*1.5,y as f32*1.5)} else {c.on_mouse_move(xrel as f32,yrel as f32)},
+          +                Event::MouseButtonDown{mouse_btn,..}|Event::MouseButtonUp{mouse_btn,..}=>{
+          +                    let down=matches!(event,Event::MouseButtonDown{..});
+          +                    let b=match mouse_btn {SMouse::Left=>MouseButton::Left,SMouse::Right=>MouseButton::Right,SMouse::Middle=>MouseButton::Middle,_=>continue};
+          +                    c.input.buttons[b as usize]=down; if down {c.on_mouse_down(b)} else {c.on_mouse_up(b)}
+          +                },
+          +                Event::MouseWheel{y,..}=>c.on_mouse_wheel(y.signum()),
+          +                Event::TextInput{text,..}=>for u in text.encode_utf16(){c.on_char(u)},
+          +                Event::KeyDown{keycode:Some(k),..}|Event::KeyUp{keycode:Some(k),..}=>{
+          +                    let down=matches!(event,Event::KeyDown{..});
+          +                    let key=match k {Keycode::A=>KeyCode::KeyA,Keycode::B=>KeyCode::KeyB,Keycode::C=>KeyCode::KeyC,Keycode::D=>KeyCode::KeyD,Keycode::E=>KeyCode::KeyE,Keycode::F=>KeyCode::KeyF,Keycode::G=>KeyCode::KeyG,Keycode::H=>KeyCode::KeyH,Keycode::I=>KeyCode::KeyI,Keycode::J=>KeyCode::KeyJ,Keycode::K=>KeyCode::KeyK,Keycode::L=>KeyCode::KeyL,Keycode::M=>KeyCode::KeyM,Keycode::N=>KeyCode::KeyN,Keycode::O=>KeyCode::KeyO,Keycode::P=>KeyCode::KeyP,Keycode::Q=>KeyCode::KeyQ,Keycode::R=>KeyCode::KeyR,Keycode::S=>KeyCode::KeyS,Keycode::T=>KeyCode::KeyT,Keycode::U=>KeyCode::KeyU,Keycode::V=>KeyCode::KeyV,Keycode::W=>KeyCode::KeyW,Keycode::X=>KeyCode::KeyX,Keycode::Y=>KeyCode::KeyY,Keycode::Z=>KeyCode::KeyZ,Keycode::Num0=>KeyCode::Digit0,Keycode::Num1=>KeyCode::Digit1,Keycode::Num2=>KeyCode::Digit2,Keycode::Num3=>KeyCode::Digit3,Keycode::Num4=>KeyCode::Digit4,Keycode::Num5=>KeyCode::Digit5,Keycode::Num6=>KeyCode::Digit6,Keycode::Num7=>KeyCode::Digit7,Keycode::Num8=>KeyCode::Digit8,Keycode::Num9=>KeyCode::Digit9,Keycode::Space=>KeyCode::Space,Keycode::Escape=>KeyCode::Escape,Keycode::Return=>KeyCode::Enter,Keycode::Tab=>KeyCode::Tab,Keycode::LShift=>KeyCode::ShiftLeft,Keycode::LCtrl=>KeyCode::ControlLeft,Keycode::Backspace=>KeyCode::Backspace,Keycode::F1=>KeyCode::F1, _=>continue};
+          +                    if let Some(d)=dik_of(key){if down{c.input.press(d)}else{c.input.release(d)}}
+          +                    if let Some(v)=vk_of(key){if down{c.on_key_down(v)}else{c.on_key_up(v)}}
+          +                }, _=>{}
+          +            }
+          +        }
+          +        if c.quit {break}
+          +        let dt=start.duration_since(last).as_millis().min(250) as i32; last=start;
+          +        c.update(dt); c.render(&mut sink);
+          +        count+=1; if tick.elapsed().as_secs_f32()>=1.0 {fps=(count as f32/tick.elapsed().as_secs_f32()).round() as u32; eprintln!("FPS {fps}"); count=0;tick=Instant::now();}
+          +        unsafe { present_mali(tex,fbo,&sink.pixels,fps); }
+          +        window.gl_swap_window();
+          +        let sleep=c.options.frame_sleep_ms(start.elapsed().as_millis() as i32); if sleep>0 {std::thread::sleep(Duration::from_millis(sleep.into()));}
+          +    }
+          +    c.shutdown(); drop(sink); unsafe {gl::DeleteTextures(1,&tex);gl::DeleteFramebuffers(1,&fbo);} drop(context); Ok(())
+          +}
+          +
+          +unsafe fn present_mali(tex:u32,fbo:u32,pixels:&[u8],fps:u32) {
+          +    unsafe {
+          +        let mut old=[0i32;7];
+          +        for (i,p) in [gl::TEXTURE_BINDING_2D,gl::READ_FRAMEBUFFER_BINDING,gl::DRAW_FRAMEBUFFER_BINDING,gl::PIXEL_UNPACK_BUFFER_BINDING,gl::UNPACK_ALIGNMENT,gl::UNPACK_ROW_LENGTH,gl::UNPACK_SKIP_ROWS].into_iter().enumerate(){gl::GetIntegerv(p,&mut old[i]);}
+          +        let mut skip=0;gl::GetIntegerv(gl::UNPACK_SKIP_PIXELS,&mut skip);
+          +        let sc=gl::IsEnabled(gl::SCISSOR_TEST); let mut box_=[0;4];gl::GetIntegerv(gl::SCISSOR_BOX,box_.as_mut_ptr());
+          +        let mut clear=[0.0;4];gl::GetFloatv(gl::COLOR_CLEAR_VALUE,clear.as_mut_ptr());
+          +        let mut mask=[0u8;4];gl::GetBooleanv(gl::COLOR_WRITEMASK,mask.as_mut_ptr());
+          +        gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER,0);gl::PixelStorei(gl::UNPACK_ALIGNMENT,4);gl::PixelStorei(gl::UNPACK_ROW_LENGTH,0);gl::PixelStorei(gl::UNPACK_SKIP_ROWS,0);gl::PixelStorei(gl::UNPACK_SKIP_PIXELS,0);
+          +        gl::BindTexture(gl::TEXTURE_2D,tex);gl::TexImage2D(gl::TEXTURE_2D,0,gl::RGBA8 as i32,640,480,0,gl::RGBA,gl::UNSIGNED_BYTE,pixels.as_ptr().cast());
+          +        gl::BindFramebuffer(gl::READ_FRAMEBUFFER,fbo);gl::FramebufferTexture2D(gl::READ_FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,tex,0);gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0);gl::Disable(gl::SCISSOR_TEST);
+          +        gl::BlitFramebuffer(0,480,640,0,0,0,640,480,gl::COLOR_BUFFER_BIT,gl::NEAREST);
+          +        gl::ColorMask(1,1,1,1);gl::Enable(gl::SCISSOR_TEST);gl::Scissor(4,452,58,24);gl::ClearColor(0.0,0.0,0.0,1.0);gl::Clear(gl::COLOR_BUFFER_BIT);
+          +        let digits=[0x7b6f,0x2492,0x73e7,0x73cf,0x5bc9,0x79cf,0x79ef,0x7249,0x7bef,0x7bcf];
+          +        gl::ClearColor(0.2,1.0,0.3,1.0);
+          +        for (i,b) in format!("{:03}",fps.min(999)).bytes().enumerate(){let bits=digits[(b-b'0') as usize];for y in 0..5 {for x in 0..3 {if bits & (1<<(14-y*3-x))!=0 {gl::Scissor(8+i as i32*16+x*4,456+(4-y)*4,4,4);gl::Clear(gl::COLOR_BUFFER_BIT);}}}}
+          +        gl::ClearColor(clear[0],clear[1],clear[2],clear[3]);gl::ColorMask(mask[0],mask[1],mask[2],mask[3]);gl::Scissor(box_[0],box_[1],box_[2],box_[3]);if sc==0{gl::Disable(gl::SCISSOR_TEST);}
+          +        gl::BindTexture(gl::TEXTURE_2D,old[0] as u32);gl::BindFramebuffer(gl::READ_FRAMEBUFFER,old[1] as u32);gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,old[2] as u32);gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER,old[3] as u32);gl::PixelStorei(gl::UNPACK_ALIGNMENT,old[4]);gl::PixelStorei(gl::UNPACK_ROW_LENGTH,old[5]);gl::PixelStorei(gl::UNPACK_SKIP_ROWS,old[6]);gl::PixelStorei(gl::UNPACK_SKIP_PIXELS,skip);
+          +    }
+          +}
+          --- a/crates/cw-render/src/gpu/shaders/screen_common.wgsl
+          +++ b/crates/cw-render/src/gpu/shaders/screen_common.wgsl
+          @@ -54,14 +54,5 @@
+           // 0.15, 0.18, 0.15, 0.12, 0.09, 0.05 at offsets -4..+4 times `step`. No vertex colour and no
+           // un-premultiply.
+           fn blur9(uv: vec2<f32>, step: vec2<f32>) -> vec4<f32> {
+          -    var w = array<f32, 9>(
+          -        0.0500000007, 0.0900000036, 0.119999997, 0.150000006, 0.180000007,
+          -        0.150000006, 0.119999997, 0.0900000036, 0.0500000007,
+          -    );
+          -    var sum = vec4<f32>(0.0);
+          -    for (var k = 0; k < 9; k = k + 1) {
+          -        let at = uv + f32(k - 4) * step;
+          -        sum = sum + textureSampleLevel(textureTexture, textureSampler, at, 0.0) * w[k];
+          -    }
+          -    return sum;
+          +    return textureSampleLevel(textureTexture, textureSampler, uv, 0.0);
+           }
+          PATCH_EOF
+          git apply --check /tmp/mali.patch
+          git apply /tmp/mali.patch
+          python3 - <<'PY_V2'
+          from pathlib import Path
+          p=Path('crates/cw-client/src/app.rs')
+          s=p.read_text()
+          a=s.index('    read: wgpu::Buffer,',s.index('struct MaliSink'))
+          b=s.index('}',a)
+          s=s[:a]+s[b:]
+          a=s.index('        enc.copy_texture_to_buffer',s.index('struct MaliSink'))
+          b=s.index('        self.read.unmap();',a)+len('        self.read.unmap();')
+          s=s[:a]+"        s.ctx.queue.submit([enc.finish()]);"+s[b:]
+          a=s.index('    let read = ctx.device.create_buffer',s.index('pub fn run_mali'))
+          b=s.index('    let mut c = Controller::new',a)
+          s=s[:a]+'''    let tex = {
+                  let raw = unsafe { target.as_hal::<wgpu_hal::api::Gles>() }.ok_or("not GLES texture")?;
+                  match &raw.inner { wgpu_hal::gles::TextureInner::Texture { raw, .. } => raw.0.get(), _ => return Err("not a GL texture".into()) }
+              };
+              let mut sink = MaliSink {inner:ExecSink {ctx,exec,res,chunk_versions:Vec::new(), #[cfg(feature="debug-overlay")] overlay:Default::default()},target,view};
+          '''+s[b:]
+          s=s.replace('wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::COPY_SRC,view_formats:&[]','wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::TEXTURE_BINDING,view_formats:&[]')
+          s=s.replace('let mut free=true; let mut tex=0; let mut fbo=0;', 'let mut free=true; let mut fbo=0; let mut cursor=[320.0f32,240.0f32];')
+          s=s.replace('gl::GenTextures(1,&mut tex); ', '')
+          s=s.replace('Event::MouseMotion{x,y,xrel,yrel,..}=>if free {c.on_mouse_move(x as f32*1.5,y as f32*1.5)} else {c.on_mouse_move(xrel as f32,yrel as f32)},','Event::MouseMotion{xrel,yrel,..}=>if free {cursor[0]=(cursor[0]+xrel as f32*0.5).clamp(0.0,639.0); cursor[1]=(cursor[1]+yrel as f32*0.5).clamp(0.0,479.0); c.on_mouse_move(cursor[0]*2.0,cursor[1]*2.0)} else {c.on_mouse_move(xrel as f32*0.5,yrel as f32*0.5)},')
+          s=s.replace('if free!=now_free { free=now_free; sdl.mouse().set_relative_mouse_mode(!free); }','if free!=now_free { free=now_free; }')
+          s=s.replace('let mut events=sdl.event_pump()?;', 'sdl.mouse().set_relative_mouse_mode(true); let mut events=sdl.event_pump()?;')
+          s=s.replace('[960,720],vec![(960,720)]','[1280,960],vec![(1280,960)]').replace('640,480,2.0/3.0); c.on_resize(960,720)','640,480,0.5); c.on_resize(1280,960)').replace('render_distance=25','render_distance=15')
+          s=s.replace('present_mali(tex,fbo,&sink.pixels,fps)','present_mali(tex,fbo,fps)').replace('gl::DeleteTextures(1,&tex);','').replace('pixels:&[u8],fps:u32','fps:u32')
+          a=s.index('        gl::BindTexture(gl::TEXTURE_2D,tex);gl::TexImage2D',s.index('unsafe fn present_mali'))
+          b=s.index('        gl::BindFramebuffer(gl::READ_FRAMEBUFFER,fbo)',a)
+          s=s[:a]+s[b:]
+          s=s.replace('gl::BlitFramebuffer(0,480,640,0,0,0,640,480','gl::BlitFramebuffer(0,0,640,480,0,0,640,480')
+          s=s.replace('        c.update(dt); c.render(&mut sink);','        let t=Instant::now(); c.update(dt); let update=t.elapsed(); let t=Instant::now(); c.render(&mut sink); let render=t.elapsed();')
+          s=s.replace('        window.gl_swap_window();','        window.gl_swap_window(); if count==0 { eprintln!("TIMING update={:?} render={:?} frame={:?}",update,render,start.elapsed()); }')
+          s=s.replace('gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0);gl::Disable(gl::SCISSOR_TEST);','gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0); assert_eq!(gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE,"Mali framebuffer incomplete"); gl::Disable(gl::SCISSOR_TEST);')
+          p.write_text(s)
+          PY_V2
+      - name: Build ARM64
+        env:
+          RUSTFLAGS: '-C target-cpu=cortex-a53'
+        run: cargo build --release -p cw-client -p cw-server
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/cw-client dist/cw-client-mali-v2
+          cp target/release/cw-server dist/cw-server
+          file dist/*
+          (cd dist && sha256sum cw-client-mali-v2 cw-server > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CubeWorld-Mali-Native-H700-V2
+          path: dist/
+          if-no-files-found: error
