@@ -1,0 +1,796 @@
+name: Cube World Mali Native H700 V10 Engine
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libdbus-1-dev cmake clang libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev libx11-dev libxrandr-dev libxcursor-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev libsdl2-dev binutils
+      - name: Apply native client patch
+        run: |
+          cat > /tmp/mali.patch <<'PATCH_EOF'
+          --- a/crates/cw-render/src/gpu/device.rs
+          +++ b/crates/cw-render/src/gpu/device.rs
+          @@ -129,7 +129,7 @@
+               /// Queue.
+               pub queue: wgpu::Queue,
+               /// Window surface.
+          -    pub surface: wgpu::Surface<'w>,
+          +    pub surface: Option<wgpu::Surface<'w>>,
+               /// Current surface configuration.
+               pub config: wgpu::SurfaceConfiguration,
+               /// Non-sRGB format the surface texture is viewed and rendered as.
+          @@ -243,7 +243,15 @@
+                   surface.configure(&device, &config);
+                   let depth = create_depth_texture_ms(&device, config.width, config.height, 1);
+                   let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+          -        Ok(Self { instance, adapter, device, queue, surface, config, color_format, depth, depth_view, sample_count: 1, msaa_view: None, capture_requested: false, captured: None })
+          +        Ok(Self { instance, adapter, device, queue, surface: Some(surface), config, color_format, depth, depth_view, sample_count: 1, msaa_view: None, capture_requested: false, captured: None })
+          +    }
+          +
+          +    pub fn external(instance: wgpu::Instance, adapter: wgpu::Adapter, device: wgpu::Device, queue: wgpu::Queue, width: u32, height: u32) -> Self {
+          +        let color_format = wgpu::TextureFormat::Rgba8Unorm;
+          +        let config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, format: color_format, color_space: wgpu::SurfaceColorSpace::Auto, width, height, present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2, alpha_mode: wgpu::CompositeAlphaMode::Opaque, view_formats: vec![] };
+          +        let depth = create_depth_texture_ms(&device, width, height, 1);
+          +        let depth_view = depth.create_view(&Default::default());
+          +        Self { instance, adapter, device, queue, surface: None, config, color_format, depth, depth_view, sample_count: 1, msaa_view: None, capture_requested: false, captured: None }
+               }
+           
+               /// The non-sRGB colour format to build pipelines and render surfaces with.
+          @@ -259,7 +267,7 @@
+                   }
+                   self.config.width = width;
+                   self.config.height = height;
+          -        self.surface.configure(&self.device, &self.config);
+          +        self.surface.as_ref().unwrap().configure(&self.device, &self.config);
+                   self.create_targets();
+               }
+           
+          @@ -307,16 +315,16 @@
+               /// Acquire the next back buffer. `None` means skip this frame (timeout, occluded,
+               /// outdated or lost surface; the surface is reconfigured where that helps).
+               pub fn acquire(&mut self) -> Option<Frame> {
+          -        let texture = match self.surface.get_current_texture() {
+          +        let texture = match self.surface.as_ref().unwrap().get_current_texture() {
+                       wgpu::CurrentSurfaceTexture::Success(t) => t,
+                       wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                           // Use this one; reconfigure before the next.
+                           let frame = self.frame_from(t);
+          -                self.surface.configure(&self.device, &self.config);
+          +                self.surface.as_ref().unwrap().configure(&self.device, &self.config);
+                           return Some(frame);
+                       }
+                       wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+          -                self.surface.configure(&self.device, &self.config);
+          +                self.surface.as_ref().unwrap().configure(&self.device, &self.config);
+                           return None;
+                       }
+                       _ => return None,
+          --- a/crates/cw-client/Cargo.toml
+          +++ b/crates/cw-client/Cargo.toml
+          @@ -7,6 +7,11 @@
+           description = "Cube World Alpha client (Cube.exe): game controller, input, audio, networking"
+           
+           [dependencies]
+          +sdl2 = "0.38"
+          +wgpu = "=30.0.1"
+          +wgpu-hal = { version = "=30.0.2", features = ["gles"] }
+          +pollster = "0.4"
+          +gl = "0.14"
+           cw-formats = { path = "../cw-formats" }
+           cw-net = { path = "../cw-net" }
+           cw-render = { path = "../cw-render" }
+          --- a/crates/cw-client/src/main.rs
+          +++ b/crates/cw-client/src/main.rs
+          @@ -30,7 +30,7 @@
+           fn main() {
+               let args: Vec<String> = std::env::args().collect();
+               let a = app::parse_args(&args);
+          -    if let Err(e) = app::run(a) {
+          +    if let Err(e) = app::run_mali(a) {
+                   eprintln!("cw-client: {e}");
+                   std::process::exit(1);
+               }
+          --- a/crates/cw-render/src/gpu/shaders/ps01_world.wgsl
+          +++ b/crates/cw-render/src/gpu/shaders/ps01_world.wgsl
+          @@ -32,5 +32,5 @@
+               let shimmer = c * (cos(angle) * 0.3 + 1.0);
+               // cmp oC0.xyz, -shininess, r3, r0: -shininess >= 0 keeps the plain colour.
+               let rgb = select(shimmer, c, -ps.shininess.x >= 0.0);
+          -    return vec4<f32>(rgb, ps.alpha.x);
+          +    return vec4<f32>(c, ps.alpha.x);
+           }
+          --- a/crates/cw-render/src/gpu/shaders/ps03_water.wgsl
+          +++ b/crates/cw-render/src/gpu/shaders/ps03_water.wgsl
+          @@ -32,7 +32,7 @@
+           
+               let deep = saturate(1.0 + y);
+               let base = deep * vec3<f32>(0.0, -0.5, 0.0) + vec3<f32>(0.0, 0.6, 1.0);
+          -    let lit = in.color.z * base + spec;
+          +    let lit = in.color.z * base;
+           
+               let fogged = mix(lit, ps.fogColor.xyz, saturate(d3));
+               let to_sky = saturate((d3 - 0.5) + (d3 - 0.5));
+          --- a/crates/cw-client/src/app.rs
+          +++ b/crates/cw-client/src/app.rs
+          @@ -1095,3 +1095,118 @@
+                   assert_eq!(vk_of(KeyCode::Enter), Some(0x0d));
+               }
+           }
+          +
+          +
+          +struct MaliSink {
+          +    inner: ExecSink,
+          +    target: wgpu::Texture,
+          +    view: wgpu::TextureView,
+          +    read: wgpu::Buffer,
+          +    pixels: Vec<u8>,
+          +}
+          +impl FrameSink for MaliSink {
+          +    fn resize(&mut self, _: u32, _: u32) {}
+          +    fn render(&mut self, frame: &FrameCommands, mut r: FrameResources<'_>) {
+          +        let s = &mut self.inner;
+          +        crate::assets::upload(&s.ctx, &mut s.res, std::mem::take(&mut r.upload));
+          +        let mut frame = frame.clone();
+          +        use cw_render::frame::PassKind;
+          +        frame.passes.retain(|p| !matches!(p.kind, PassKind::Clouds | PassKind::Shadows | PassKind::Stars));
+          +        s.sync(&frame, &r);
+          +        let mut enc = s.ctx.device.create_command_encoder(&Default::default());
+          +        s.exec.encode(&s.ctx.device, &s.ctx.queue, &mut enc, cw_render::gpu::exec::FrameTarget::new(&self.view, &s.ctx.depth_view, 640, 480), &frame, &mut s.res);
+          +        enc.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, wgpu::TexelCopyBufferInfo { buffer: &self.read, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2560), rows_per_image: Some(480) } }, wgpu::Extent3d { width: 640, height: 480, depth_or_array_layers: 1 });
+          +        s.ctx.queue.submit([enc.finish()]);
+          +        self.read.map_async(wgpu::MapMode::Read, .., |_| {});
+          +        s.ctx.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll");
+          +        { let v = self.read.get_mapped_range(..).expect("readback"); self.pixels.copy_from_slice(&v); }
+          +        self.read.unmap();
+          +    }
+          +}
+          +
+          +pub fn run_mali(args: Args) -> Result<(), String> {
+          +    use sdl2::{event::Event, keyboard::Keycode, mouse::MouseButton as SMouse};
+          +    let sdl = sdl2::init()?;
+          +    let video = sdl.video()?;
+          +    let attr = video.gl_attr();
+          +    attr.set_context_profile(sdl2::video::GLProfile::GLES);
+          +    attr.set_context_version(3,0);
+          +    let window = video.window("Cube World Mali",640,480).opengl().fullscreen().build().map_err(|e|e.to_string())?;
+          +    let context = window.gl_create_context()?;
+          +    window.gl_make_current(&context)?;
+          +    gl::load_with(|n| video.gl_get_proc_address(n) as *const _);
+          +    let exposed = unsafe { wgpu_hal::gles::Adapter::new_external(|n| video.gl_get_proc_address(n) as *const _, Default::default()) }.ok_or("external adapter failed")?;
+          +    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+          +    let adapter = unsafe { instance.create_adapter_from_hal(exposed) };
+          +    eprintln!("MALI_ADAPTER {:?}", adapter.get_info());
+          +    let features = adapter.features() & (wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES);
+          +    let (device,queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), required_features: features, ..Default::default() })).map_err(|e|e.to_string())?;
+          +    let ctx = GpuContext::external(instance,adapter,device,queue,640,480);
+          +    let exec = Executor::new(&ctx.device,&ctx.queue,ctx.color_format());
+          +    let res = Resources::new(&ctx.device,ctx.color_format());
+          +    let target = ctx.device.create_texture(&wgpu::TextureDescriptor { label: Some("native frame"), size: wgpu::Extent3d {width:640,height:480,depth_or_array_layers:1}, mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,usage:wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::COPY_SRC,view_formats:&[] });
+          +    let view = target.create_view(&Default::default());
+          +    let read = ctx.device.create_buffer(&wgpu::BufferDescriptor {label:Some("native readback"),size:640*480*4,usage:wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::MAP_READ,mapped_at_creation:false});
+          +    let mut sink = MaliSink {inner:ExecSink {ctx,exec,res,chunk_versions:Vec::new(), #[cfg(feature="debug-overlay")] overlay:Default::default()},target,view,read,pixels:vec![0;640*480*4]};
+          +    let mut c = Controller::new(default_game_dir(),[960,720],vec![(960,720)],args.server_flag,args.server_address);
+          +    c.options.anti_aliasing=0; c.options.render_distance=25;
+          +    c.set_back_buffer(640,480,2.0/3.0); c.on_resize(960,720);
+          +    let mut events=sdl.event_pump()?;
+          +    let mut last=Instant::now(); let mut tick=last; let mut count=0u32; let mut fps=0u32;
+          +    let mut free=true; let mut tex=0; let mut fbo=0;
+          +    unsafe { gl::GenTextures(1,&mut tex); gl::GenFramebuffers(1,&mut fbo); }
+          +    eprintln!("MALI_GAME_LOOP_OK");
+          +    while !c.quit {
+          +        let start=Instant::now();
+          +        let now_free=c.is_cursor_free();
+          +        if free!=now_free { free=now_free; sdl.mouse().set_relative_mouse_mode(!free); }
+          +        for event in events.poll_iter() {
+          +            match event {
+          +                Event::Quit{..}=>c.quit=true,
+          +                Event::MouseMotion{x,y,xrel,yrel,..}=>if free {c.on_mouse_move(x as f32*1.5,y as f32*1.5)} else {c.on_mouse_move(xrel as f32,yrel as f32)},
+          +                Event::MouseButtonDown{mouse_btn,..}|Event::MouseButtonUp{mouse_btn,..}=>{
+          +                    let down=matches!(event,Event::MouseButtonDown{..});
+          +                    let b=match mouse_btn {SMouse::Left=>MouseButton::Left,SMouse::Right=>MouseButton::Right,SMouse::Middle=>MouseButton::Middle,_=>continue};
+          +                    c.input.buttons[b as usize]=down; if down {c.on_mouse_down(b)} else {c.on_mouse_up(b)}
+          +                },
+          +                Event::MouseWheel{y,..}=>c.on_mouse_wheel(y.signum()),
+          +                Event::TextInput{text,..}=>for u in text.encode_utf16(){c.on_char(u)},
+          +                Event::KeyDown{keycode:Some(k),..}|Event::KeyUp{keycode:Some(k),..}=>{
+          +                    let down=matches!(event,Event::KeyDown{..});
+          +                    let key=match k {Keycode::A=>KeyCode::KeyA,Keycode::B=>KeyCode::KeyB,Keycode::C=>KeyCode::KeyC,Keycode::D=>KeyCode::KeyD,Keycode::E=>KeyCode::KeyE,Keycode::F=>KeyCode::KeyF,Keycode::G=>KeyCode::KeyG,Keycode::H=>KeyCode::KeyH,Keycode::I=>KeyCode::KeyI,Keycode::J=>KeyCode::KeyJ,Keycode::K=>KeyCode::KeyK,Keycode::L=>KeyCode::KeyL,Keycode::M=>KeyCode::KeyM,Keycode::N=>KeyCode::KeyN,Keycode::O=>KeyCode::KeyO,Keycode::P=>KeyCode::KeyP,Keycode::Q=>KeyCode::KeyQ,Keycode::R=>KeyCode::KeyR,Keycode::S=>KeyCode::KeyS,Keycode::T=>KeyCode::KeyT,Keycode::U=>KeyCode::KeyU,Keycode::V=>KeyCode::KeyV,Keycode::W=>KeyCode::KeyW,Keycode::X=>KeyCode::KeyX,Keycode::Y=>KeyCode::KeyY,Keycode::Z=>KeyCode::KeyZ,Keycode::Num0=>KeyCode::Digit0,Keycode::Num1=>KeyCode::Digit1,Keycode::Num2=>KeyCode::Digit2,Keycode::Num3=>KeyCode::Digit3,Keycode::Num4=>KeyCode::Digit4,Keycode::Num5=>KeyCode::Digit5,Keycode::Num6=>KeyCode::Digit6,Keycode::Num7=>KeyCode::Digit7,Keycode::Num8=>KeyCode::Digit8,Keycode::Num9=>KeyCode::Digit9,Keycode::Space=>KeyCode::Space,Keycode::Escape=>KeyCode::Escape,Keycode::Return=>KeyCode::Enter,Keycode::Tab=>KeyCode::Tab,Keycode::LShift=>KeyCode::ShiftLeft,Keycode::LCtrl=>KeyCode::ControlLeft,Keycode::Backspace=>KeyCode::Backspace,Keycode::F1=>KeyCode::F1, _=>continue};
+          +                    if let Some(d)=dik_of(key){if down{c.input.press(d)}else{c.input.release(d)}}
+          +                    if let Some(v)=vk_of(key){if down{c.on_key_down(v)}else{c.on_key_up(v)}}
+          +                }, _=>{}
+          +            }
+          +        }
+          +        if c.quit {break}
+          +        let dt=start.duration_since(last).as_millis().min(250) as i32; last=start;
+          +        c.update(dt); c.render(&mut sink);
+          +        count+=1; if tick.elapsed().as_secs_f32()>=1.0 {fps=(count as f32/tick.elapsed().as_secs_f32()).round() as u32; eprintln!("FPS {fps}"); count=0;tick=Instant::now();}
+          +        unsafe { present_mali(tex,fbo,&sink.pixels,fps); }
+          +        window.gl_swap_window();
+          +        let sleep=c.options.frame_sleep_ms(start.elapsed().as_millis() as i32); if sleep>0 {std::thread::sleep(Duration::from_millis(sleep.into()));}
+          +    }
+          +    c.shutdown(); drop(sink); unsafe {gl::DeleteTextures(1,&tex);gl::DeleteFramebuffers(1,&fbo);} drop(context); Ok(())
+          +}
+          +
+          +unsafe fn present_mali(tex:u32,fbo:u32,pixels:&[u8],fps:u32) {
+          +    unsafe {
+          +        let mut old=[0i32;7];
+          +        for (i,p) in [gl::TEXTURE_BINDING_2D,gl::READ_FRAMEBUFFER_BINDING,gl::DRAW_FRAMEBUFFER_BINDING,gl::PIXEL_UNPACK_BUFFER_BINDING,gl::UNPACK_ALIGNMENT,gl::UNPACK_ROW_LENGTH,gl::UNPACK_SKIP_ROWS].into_iter().enumerate(){gl::GetIntegerv(p,&mut old[i]);}
+          +        let mut skip=0;gl::GetIntegerv(gl::UNPACK_SKIP_PIXELS,&mut skip);
+          +        let sc=gl::IsEnabled(gl::SCISSOR_TEST); let mut box_=[0;4];gl::GetIntegerv(gl::SCISSOR_BOX,box_.as_mut_ptr());
+          +        let mut clear=[0.0;4];gl::GetFloatv(gl::COLOR_CLEAR_VALUE,clear.as_mut_ptr());
+          +        let mut mask=[0u8;4];gl::GetBooleanv(gl::COLOR_WRITEMASK,mask.as_mut_ptr());
+          +        gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER,0);gl::PixelStorei(gl::UNPACK_ALIGNMENT,4);gl::PixelStorei(gl::UNPACK_ROW_LENGTH,0);gl::PixelStorei(gl::UNPACK_SKIP_ROWS,0);gl::PixelStorei(gl::UNPACK_SKIP_PIXELS,0);
+          +        gl::BindTexture(gl::TEXTURE_2D,tex);gl::TexImage2D(gl::TEXTURE_2D,0,gl::RGBA8 as i32,640,480,0,gl::RGBA,gl::UNSIGNED_BYTE,pixels.as_ptr().cast());
+          +        gl::BindFramebuffer(gl::READ_FRAMEBUFFER,fbo);gl::FramebufferTexture2D(gl::READ_FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,tex,0);gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0);gl::Disable(gl::SCISSOR_TEST);
+          +        gl::BlitFramebuffer(0,480,640,0,0,0,640,480,gl::COLOR_BUFFER_BIT,gl::NEAREST);
+          +        gl::ColorMask(1,1,1,1);gl::Enable(gl::SCISSOR_TEST);gl::Scissor(4,452,58,24);gl::ClearColor(0.0,0.0,0.0,1.0);gl::Clear(gl::COLOR_BUFFER_BIT);
+          +        let digits=[0x7b6f,0x2492,0x73e7,0x73cf,0x5bc9,0x79cf,0x79ef,0x7249,0x7bef,0x7bcf];
+          +        gl::ClearColor(0.2,1.0,0.3,1.0);
+          +        for (i,b) in format!("{:03}",fps.min(999)).bytes().enumerate(){let bits=digits[(b-b'0') as usize];for y in 0..5 {for x in 0..3 {if bits & (1<<(14-y*3-x))!=0 {gl::Scissor(8+i as i32*16+x*4,456+(4-y)*4,4,4);gl::Clear(gl::COLOR_BUFFER_BIT);}}}}
+          +        gl::ClearColor(clear[0],clear[1],clear[2],clear[3]);gl::ColorMask(mask[0],mask[1],mask[2],mask[3]);gl::Scissor(box_[0],box_[1],box_[2],box_[3]);if sc==0{gl::Disable(gl::SCISSOR_TEST);}
+          +        gl::BindTexture(gl::TEXTURE_2D,old[0] as u32);gl::BindFramebuffer(gl::READ_FRAMEBUFFER,old[1] as u32);gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,old[2] as u32);gl::BindBuffer(gl::PIXEL_UNPACK_BUFFER,old[3] as u32);gl::PixelStorei(gl::UNPACK_ALIGNMENT,old[4]);gl::PixelStorei(gl::UNPACK_ROW_LENGTH,old[5]);gl::PixelStorei(gl::UNPACK_SKIP_ROWS,old[6]);gl::PixelStorei(gl::UNPACK_SKIP_PIXELS,skip);
+          +    }
+          +}
+          --- a/crates/cw-render/src/gpu/shaders/screen_common.wgsl
+          +++ b/crates/cw-render/src/gpu/shaders/screen_common.wgsl
+          @@ -54,14 +54,5 @@
+           // 0.15, 0.18, 0.15, 0.12, 0.09, 0.05 at offsets -4..+4 times `step`. No vertex colour and no
+           // un-premultiply.
+           fn blur9(uv: vec2<f32>, step: vec2<f32>) -> vec4<f32> {
+          -    var w = array<f32, 9>(
+          -        0.0500000007, 0.0900000036, 0.119999997, 0.150000006, 0.180000007,
+          -        0.150000006, 0.119999997, 0.0900000036, 0.0500000007,
+          -    );
+          -    var sum = vec4<f32>(0.0);
+          -    for (var k = 0; k < 9; k = k + 1) {
+          -        let at = uv + f32(k - 4) * step;
+          -        sum = sum + textureSampleLevel(textureTexture, textureSampler, at, 0.0) * w[k];
+          -    }
+          -    return sum;
+          +    return textureSampleLevel(textureTexture, textureSampler, uv, 0.0);
+           }
+          PATCH_EOF
+          git apply --check /tmp/mali.patch
+          git apply /tmp/mali.patch
+          python3 - <<'PY_V2'
+          from pathlib import Path
+          p=Path('crates/cw-client/src/app.rs')
+          s=p.read_text()
+          a=s.index('    read: wgpu::Buffer,',s.index('struct MaliSink'))
+          b=s.index('}',a)
+          s=s[:a]+s[b:]
+          a=s.index('        enc.copy_texture_to_buffer',s.index('struct MaliSink'))
+          b=s.index('        self.read.unmap();',a)+len('        self.read.unmap();')
+          s=s[:a]+"        s.ctx.queue.submit([enc.finish()]);"+s[b:]
+          a=s.index('    let read = ctx.device.create_buffer',s.index('pub fn run_mali'))
+          b=s.index('    let mut c = Controller::new',a)
+          s=s[:a]+'''    let tex = {
+                  let raw = unsafe { target.as_hal::<wgpu_hal::api::Gles>() }.ok_or("not GLES texture")?;
+                  match &raw.inner { wgpu_hal::gles::TextureInner::Texture { raw, .. } => raw.0.get(), _ => return Err("not a GL texture".into()) }
+              };
+              let mut sink = MaliSink {inner:ExecSink {ctx,exec,res,chunk_versions:Vec::new(), #[cfg(feature="debug-overlay")] overlay:Default::default()},target,view};
+          '''+s[b:]
+          s=s.replace('wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::COPY_SRC,view_formats:&[]','wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::TEXTURE_BINDING,view_formats:&[]')
+          s=s.replace('let mut free=true; let mut tex=0; let mut fbo=0;', 'let mut free=true; let mut fbo=0; let mut cursor=[320.0f32,240.0f32];')
+          s=s.replace('gl::GenTextures(1,&mut tex); ', '')
+          s=s.replace('Event::MouseMotion{x,y,xrel,yrel,..}=>if free {c.on_mouse_move(x as f32*1.5,y as f32*1.5)} else {c.on_mouse_move(xrel as f32,yrel as f32)},','Event::MouseMotion{xrel,yrel,..}=>if free {cursor[0]=(cursor[0]+xrel as f32*0.5).clamp(0.0,639.0); cursor[1]=(cursor[1]+yrel as f32*0.5).clamp(0.0,479.0); c.on_mouse_move(cursor[0]*2.0,cursor[1]*2.0)} else {c.on_mouse_move(xrel as f32*0.5,yrel as f32*0.5)},')
+          s=s.replace('if free!=now_free { free=now_free; sdl.mouse().set_relative_mouse_mode(!free); }','if free!=now_free { free=now_free; }')
+          s=s.replace('let mut events=sdl.event_pump()?;', 'sdl.mouse().set_relative_mouse_mode(true); let mut events=sdl.event_pump()?;')
+          s=s.replace('[960,720],vec![(960,720)]','[1280,960],vec![(1280,960)]').replace('640,480,2.0/3.0); c.on_resize(960,720)','640,480,0.5); c.on_resize(1280,960)').replace('render_distance=25','render_distance=64; c.shared.render_distance.store(64, std::sync::atomic::Ordering::Relaxed)')
+          s=s.replace('present_mali(tex,fbo,&sink.pixels,fps)','present_mali(tex,fbo,fps)').replace('gl::DeleteTextures(1,&tex);','').replace('pixels:&[u8],fps:u32','fps:u32')
+          a=s.index('        gl::BindTexture(gl::TEXTURE_2D,tex);gl::TexImage2D',s.index('unsafe fn present_mali'))
+          b=s.index('        gl::BindFramebuffer(gl::READ_FRAMEBUFFER,fbo)',a)
+          s=s[:a]+s[b:]
+          s=s.replace('gl::BlitFramebuffer(0,480,640,0,0,0,640,480','gl::BlitFramebuffer(0,0,640,480,0,0,640,480')
+          s=s.replace('        c.update(dt); c.render(&mut sink);','        let t=Instant::now(); c.update(dt); let update=t.elapsed(); let t=Instant::now(); c.render(&mut sink); let render=t.elapsed();')
+          s=s.replace('        window.gl_swap_window();','        window.gl_swap_window(); if count==0 { eprintln!("TIMING update={:?} render={:?} frame={:?}",update,render,start.elapsed()); }')
+          s=s.replace('gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0);gl::Disable(gl::SCISSOR_TEST);','gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0); assert_eq!(gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE,"Mali framebuffer incomplete"); gl::Disable(gl::SCISSOR_TEST);')
+          p.write_text(s)
+          PY_V2
+      - name: H700 graphics and visibility
+        run: |
+          python3 - <<'PY_V3'
+          from pathlib import Path
+          
+          def edit(path, old, new):
+              p=Path(path); s=p.read_text(); assert s.count(old)==1, (path,old,s.count(old)); p.write_text(s.replace(old,new))
+          
+          root='crates/cw-client/src/'
+          edit(root+'scene/creatures.rs', 'if !ray_drawn && !sphere_visible(&ctx.planes, &gc.camera, epos, f32_at(e, 0x78), range) {', 'if id != gc.player && !ray_drawn && !sphere_visible(&ctx.planes, &gc.camera, epos, f32_at(e, 0x78).max(4.0), range.max(64.0)) {')
+          edit(root+'controller.rs', 'self.scene.camera.fog_distance = self.fog_distance;', 'self.scene.camera.fog_distance = self.fog_distance.max(64.0);')
+          edit(root+'scene.rs', 'out.shadows = fx::shadows(&ctx);', 'out.shadows.clear();')
+          edit(root+'scene.rs', 'out.ribbons = fx::ribbons(&ctx);', 'out.ribbons.clear();')
+          edit(root+'particles.rs', 'self.particles.push(p);', 'if self.particles.len() < 96 { self.particles.push(p); }')
+          edit(root+'scene.rs', '        ctx.particle_range,\n        ctx.world_material,', '        ctx.particle_range.min(24.0),\n        ctx.world_material,')
+          root='crates/cw-render/src/gpu/shaders/'
+          p=Path(root+'vs00_world.wgsl'); s=p.read_text(); a=s.index('    // Ten point lights'); b=s.index('    // Combine:',a); s=s[:a]+s[b:]; p.write_text(s)
+          p=Path(root+'ps01_world.wgsl'); s=p.read_text(); a=s.index('@fragment'); p.write_text(s[:a]+'@fragment\nfn fs_main(in: WorldPsIn) -> @location(0) vec4<f32> {\n    let fog = saturate(in.texcoord0.w * 0.65);\n    return vec4<f32>(mix(in.color.xyz, ps.fogColor.xyz, fog), ps.alpha.x);\n}\n')
+          p=Path(root+'ps03_water.wgsl'); s=p.read_text(); a=s.index('@fragment'); p.write_text(s[:a]+'@fragment\nfn fs_main(in: WorldPsIn) -> @location(0) vec4<f32> {\n    let base = vec3<f32>(0.04, 0.36, 0.72) * in.color.z;\n    return vec4<f32>(mix(base, ps.fogColor.xyz, saturate(in.texcoord0.w)), 0.85);\n}\n')
+          PY_V3
+      - name: V4 experimental optimizations
+        run: |
+          python3 - <<'PY_V4'
+          from pathlib import Path
+          import re
+
+          def edit(path, old, new):
+              p=Path(path); s=p.read_text(); assert s.count(old)==1,(path,old,s.count(old)); p.write_text(s.replace(old,new))
+          r='crates/cw-client/src/'
+          edit(r+'scene.rs','if p.flags & 4 != 0 {','if p.flags & 4 != 0 && std::env::var_os("CW_V4_WIND").is_some() {')
+          edit(r+'scene.rs','if p.kind == 0x3c {','if p.kind == 0x3c {\n                if std::env::var_os("CW_V4_LEAVES").is_none() { continue; }')
+          edit(r+'scene.rs','let (lights, dynamic) = gather_lights(&ctx, emitter_lights, &mut timer);','let (lights, dynamic) = if std::env::var_os("CW_V4_LIGHTS").is_some() { gather_lights(&ctx, emitter_lights, &mut timer) } else { (Vec::new(), Vec::new()) };')
+          edit(r+'scene.rs','let dist2 = length_sq(float_from_fixed(sub3(centre, cam)));','let dist2 = length_sq(float_from_fixed(sub3(centre, cam)));\n            if std::env::var_os("CW_V4_FULL_PROPS").is_none() && p.flags & 4 != 0 && dist2 > 32.0 * 32.0 && model.size[2] as f32 * p.scale < 1.5 { continue; }')
+          edit(r+'scene.rs','gc.item_preview_rotation = hud::item_preview_spin(gc.item_preview_rotation, dt_ms);','if std::env::var_os("CW_V4_SPIN").is_some() { gc.item_preview_rotation = hud::item_preview_spin(gc.item_preview_rotation, dt_ms); }')
+          p=Path(r+'app.rs'); s=p.read_text(); s=s.replace('PassKind::Clouds | PassKind::Shadows | PassKind::Stars','PassKind::Clouds | PassKind::Shadows | PassKind::Stars | PassKind::Sun | PassKind::Ribbons'); s=s.replace('    target: wgpu::Texture,','    target: wgpu::Texture,\n    last_stats: (u32,u32,u32),'); s=s.replace('},target,view};','},target,view,last_stats:(0,0,0)};'); s=s.replace('        s.exec.encode(&s.ctx.device, &s.ctx.queue, &mut enc,','        let stats = s.exec.encode(&s.ctx.device, &s.ctx.queue, &mut enc,'); s=s.replace('        s.ctx.queue.submit([enc.finish()]);','        self.last_stats=(stats.draws,stats.render_passes,stats.skipped);\n        s.ctx.queue.submit([enc.finish()]);'); s=s.replace('unsafe { present_mali(tex,fbo,fps); }','let pt=Instant::now(); unsafe { present_mali(tex,fbo,fps); } let present=pt.elapsed(); let st=Instant::now();'); s=s.replace('eprintln!("TIMING update={:?} render={:?} frame={:?}",update,render,start.elapsed());','eprintln!("TIMING update={:?} render={:?} present={:?} swap={:?} frame={:?} draws={} passes={} skipped={}",update,render,present,st.elapsed(),start.elapsed(),sink.last_stats.0,sink.last_stats.1,sink.last_stats.2);'); p.write_text(s)
+          # Flat per-face terrain colour removes four costly ambient-occlusion/light samples per quad.
+          p=Path('crates/cw-render/src/mesh.rs'); s=p.read_text(); old='let lit = vertex_light(world, world_pos[0] + c[0], world_pos[1] + c[1], world_pos[2] + c[2], color, normal, false);'; assert s.count(old)==1; s=s.replace(old,'let lit = if std::env::var_os("CW_V4_SMOOTH_LIGHT").is_some() { vertex_light(world, world_pos[0] + c[0], world_pos[1] + c[1], world_pos[2] + c[2], color, normal, false) } else { color };'); p.write_text(s)
+          PY_V4
+      - name: V5 performance patch
+        run: |
+          python3 - <<'PY_V5'
+          from pathlib import Path
+          import re
+          
+          def edit(p, a, b):
+              p=Path(p); s=p.read_text(); assert s.count(a)==1,(str(p),a,s.count(a)); p.write_text(s.replace(a,b))
+          r=Path('crates/cw-client/src'); m=Path('crates/cw-render/src/mesh.rs')
+          # Cache toggles at first use, no repeated getenv in hot loops.
+          for p in [r/'scene.rs',m]:
+              s=p.read_text()
+              s=re.sub(r'std::env::var_os\("(CW_V4_[A-Z_]+)"\).is_some\(\)',lambda x:'{ static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *FLAG.get_or_init(|| std::env::var_os("'+x[1]+'").is_some()) }',s)
+              s=re.sub(r'std::env::var_os\("(CW_V4_[A-Z_]+)"\).is_none\(\)',lambda x:'!{ static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *FLAG.get_or_init(|| std::env::var_os("'+x[1]+'").is_some()) }',s)
+              p.write_text(s)
+          # Merge coplanar opaque unit faces of identical packed colour; preserve water and winding.
+          helper = r"""
+          fn h700_merge(slab: &mut ChunkMesh) {
+              use std::collections::{BTreeMap, BTreeSet};
+              let mut groups: BTreeMap<(u8,u8,u32), BTreeSet<(u8,u8)>> = BTreeMap::new();
+              let mut vertices = Vec::new();
+              let mut indices = Vec::new();
+              let mut indices2 = Vec::new();
+              for (src,dst,merge) in [(&slab.indices,&mut indices,true),(&slab.indices2,&mut indices2,false)] {
+                  for q in src.chunks_exact(6) {
+                      let vs = [slab.vertices[q[0] as usize],slab.vertices[q[1] as usize],slab.vertices[q[2] as usize],slab.vertices[q[5] as usize]];
+                      let face=vs[0].pos[3]; let axis=(face/2) as usize;
+                      let u=(axis+1)%3; let v=(axis+2)%3;
+                      let lo_u=vs.iter().map(|x|x.pos[u]).min().unwrap();
+                      let lo_v=vs.iter().map(|x|x.pos[v]).min().unwrap();
+                      if merge && vs.iter().all(|x|x.color==vs[0].color && x.pos[axis]==vs[0].pos[axis]) {
+                          groups.entry((face,vs[0].pos[axis],vs[0].color)).or_default().insert((lo_u,lo_v));
+                      } else {
+                          let b=vertices.len() as u32; vertices.extend_from_slice(&vs); dst.extend_from_slice(&[b,b+1,b+2,b,b+2,b+3]);
+                      }
+                  }
+              }
+              for ((face,plane,color),mut cells) in groups {
+                  let axis=(face/2) as usize; let u=(axis+1)%3; let v=(axis+2)%3;
+                  let (_,corners)=FACES.iter().find(|(n,_)|face_index(*n)==face).unwrap();
+                  while let Some(&(x,y))=cells.first() {
+                      let mut w=1u8; let mut h=1u8;
+                      while x.checked_add(w).is_some_and(|xx| xx<255 && cells.contains(&(xx,y))) {w+=1;}
+                      while y.checked_add(h).is_some_and(|yy| yy<255 && (0..w).all(|dx|cells.contains(&(x+dx,yy)))) {h+=1;}
+                      for dx in 0..w {for dy in 0..h {cells.remove(&(x+dx,y+dy));}}
+                      let b=vertices.len() as u32;
+                      for c in corners {let mut pos=[0u8;4];pos[3]=face;pos[axis]=plane;pos[u]=x+if c[u]==0{0}else{w};pos[v]=y+if c[v]==0{0}else{h};vertices.push(WorldVertex{pos,color});}
+                      indices.extend_from_slice(&[b,b+1,b+2,b,b+2,b+3]);
+                  }
+              }
+              slab.vertices=vertices; slab.indices=indices; slab.indices2=indices2;
+          }
+          """
+          s=m.read_text(); anchor='/// A voxel model\'s mesh'; assert s.count(anchor)==1; s=s.replace(anchor,helper+'\n'+anchor)
+          s=s.replace('    let mut props = Vec::new();\n    access.write', '    static MERGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();\n    if *MERGE.get_or_init(|| std::env::var_os("CW_V5_NO_MERGE").is_none()) { for slab in &mut slabs { h700_merge(slab); } }\n    let mut props = Vec::new();\n    access.write')
+          s=s.replace('let ao = grid.occlusion(p[0], p[1], p[2], normal);','let ao = { static AO: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); if *AO.get_or_init(|| std::env::var_os("CW_V5_MODEL_AO").is_some()) { grid.occlusion(p[0], p[1], p[2], normal) } else { 1.0 } };')
+          m.write_text(s)
+          # Preset-dependent decoration and particles, never change creature visibility.
+          p=r/'scene.rs'; s=p.read_text(); a='let dist2 = length_sq(float_from_fixed(sub3(centre, cam)));'; assert s.count(a)==1
+          s=s.replace(a,a+'\n            let cutoff = { static P: std::sync::OnceLock<f32> = std::sync::OnceLock::new(); *P.get_or_init(|| match std::env::var("CW_V5_PROFILE").as_deref() { Ok("potato") => 16.0, Ok("balanced") => 48.0, _ => 24.0 }) };\n            if p.flags & 4 != 0 && dist2 > cutoff*cutoff && sz as f32 * p.scale < 3.0 { continue; }'); p.write_text(s)
+          p=r/'particles.rs'; s=p.read_text(); s=s.replace('self.particles.len() < 96','self.particles.len() < { static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *CAP.get_or_init(|| match std::env::var("CW_V5_PROFILE").as_deref() { Ok("potato") => 8, Ok("balanced") => 64, _ => 24 }) }'); p.write_text(s)
+          # Limit cosmetic whirl draw count, leave combat simulation intact.
+          p=r/'scene/creatures.rs'; s=p.read_text(); a='for i in 0..count.max(0) {'; assert s.count(a)>=2
+          s=s.replace(a,'for i in 0..count.max(0).min({ static CAP: std::sync::OnceLock<i32> = std::sync::OnceLock::new(); *CAP.get_or_init(|| match std::env::var("CW_V5_PROFILE").as_deref() { Ok("potato") => 4, Ok("balanced") => 24, _ => 10 }) }) {'); p.write_text(s)
+          # Render target resolution selected at startup; logical UI size remains unchanged.
+          p=r/'app.rs'; s=p.read_text(); a=s.index('struct MaliSink'); head=s[:a]; t=s[a:]
+          t=t.replace('    target: wgpu::Texture,','    target: wgpu::Texture,\n    width: u32, height: u32,')
+          t=t.replace('&s.ctx.depth_view, 640, 480)', '&s.ctx.depth_view, self.width, self.height)')
+          t=t.replace('let ctx = GpuContext::external(instance,adapter,device,queue,640,480);','let (rw,rh) = match std::env::var("CW_V5_PROFILE").as_deref() { Ok("potato") => (320u32,240u32), Ok("balanced") => (640,480), _ => (480,360) };\n    eprintln!("V5 target {rw}x{rh}");\n    let ctx = GpuContext::external(instance,adapter,device,queue,rw,rh);')
+          t=t.replace('width:640,height:480,depth_or_array_layers:1','width:rw,height:rh,depth_or_array_layers:1')
+          t=t.replace('},target,view,last_stats:', '},target,view,width:rw,height:rh,last_stats:')
+          t=t.replace('present_mali(tex,fbo,fps)', 'present_mali(tex,fbo,rw as i32,rh as i32)')
+          t=t.replace('tex:u32,fbo:u32,fps:u32','tex:u32,fbo:u32,rw:i32,rh:i32')
+          t=t.replace('gl::BlitFramebuffer(0,0,640,480,0,0,640,480','gl::BlitFramebuffer(0,0,rw,rh,0,0,640,480')
+          a=t.index('        gl::ColorMask(1,1,1,1);'); b=t.index('        gl::ClearColor(clear[0]',a); t=t[:a]+t[b:]
+          # Correct logical-to-target scaling; the entire framebuffer is scaled, including UI.
+          t=t.replace('c.set_back_buffer(640,480,0.5);','c.set_back_buffer(rw,rh,rw as f64 / 1280.0);')
+          # Avoid redundant GL queries and framebuffer validation on every frame.
+          a=t.index('        let mut old=[0i32;7];',t.index('unsafe fn present_mali'))
+          t=t[:a]+"""        let mut old=[0i32;2];
+                  gl::GetIntegerv(gl::READ_FRAMEBUFFER_BINDING,&mut old[0]);
+                  gl::GetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING,&mut old[1]);
+                  let sc=gl::IsEnabled(gl::SCISSOR_TEST);
+                  gl::BindFramebuffer(gl::READ_FRAMEBUFFER,fbo);
+                  static ATTACHED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                  ATTACHED.get_or_init(|| { gl::FramebufferTexture2D(gl::READ_FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,tex,0); assert_eq!(gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE); });
+                  gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,0);
+                  gl::Disable(gl::SCISSOR_TEST);
+                  gl::BlitFramebuffer(0,rh,rw,0,0,0,640,480,gl::COLOR_BUFFER_BIT,gl::NEAREST);
+                  if sc!=0 {gl::Enable(gl::SCISSOR_TEST);}
+                  gl::BindFramebuffer(gl::READ_FRAMEBUFFER,old[0] as u32);
+                  gl::BindFramebuffer(gl::DRAW_FRAMEBUFFER,old[1] as u32);
+              }
+          }
+          """
+          p.write_text(head+t)
+          PY_V5
+      - name: V6 dynamic terrain LOD
+        run: |
+          python3 - <<'PY_V6'
+          from pathlib import Path
+
+          def edit(p,a,b):
+              p=Path(p); s=p.read_text(); assert s.count(a)==1,(str(p),a,s.count(a)); p.write_text(s.replace(a,b))
+          r='crates/cw-client/src/'
+          edit(r+'controller.rs',"    pub chunks: &'a [(u64, Option<Arc<ChunkBuild>>)],","    pub chunks: &'a [(u64, Option<Arc<ChunkBuild>>)],\n    pub lod_player: [i64; 3],")
+          edit(r+'controller.rs','FrameResources { chunks: &res_chunks,','FrameResources { lod_player: player_position, chunks: &res_chunks,')
+          p=r+'app.rs'
+          edit(p,'chunk_versions: Vec<u64>,','chunk_versions: Vec<(u64,u8)>,')
+          edit(p,'vec![u64::MAX; r.chunks.len()]','vec![(u64::MAX,0); r.chunks.len()]')
+          edit(p,"            if self.chunk_versions[i] == *v {\n                continue;\n            }\n            self.chunk_versions[i] = *v;\n            match b {\n                Some(b) => self.res.upload_chunk(dev, i, b),", """            let old = self.chunk_versions[i];
+                      let lod = b.as_ref().map_or(1, |b| cw_render::mesh::h700_lod_level(b, r.lod_player, if old.0 == *v {old.1} else {0}));
+                      if old == (*v,lod) { continue; }
+                      self.chunk_versions[i] = (*v,lod);
+                      match b {
+                          Some(b) if lod > 1 => {
+                              let reduced = cw_render::mesh::h700_lod(b, lod);
+                              eprintln!("LOD chunk={},{} step={} triangles={} -> {}",b.cx,b.cy,lod,b.buffers.iter().map(|s|s.indices.len()/3).sum::<usize>(),reduced.buffers.iter().map(|s|s.indices.len()/3).sum::<usize>());
+                              self.res.upload_chunk(dev, i, &reduced);
+                          },
+                          Some(b) => self.res.upload_chunk(dev, i, b),""")
+          p=Path('crates/cw-render/src/mesh.rs')
+          with p.open('a') as f: f.write(r"""
+          // H700 visual-only terrain LOD. World data and water indices remain unchanged.
+          pub fn h700_lod_level(b: &ChunkBuild, player: [i64;3], old: u8) -> u8 {
+              static PROFILE: std::sync::OnceLock<(f64,f64,f64)> = std::sync::OnceLock::new();
+              let &(a,c,d)=PROFILE.get_or_init(|| {
+                  if std::env::var_os("CW_V6_NO_LOD").is_some() { return (f64::INFINITY,f64::INFINITY,f64::INFINITY); }
+                  match std::env::var("CW_V5_PROFILE").as_deref() {
+                      Ok("balanced") => (32.,56.,80.), Ok("potato") => (16.,32.,48.), _ => (24.,40.,56.)
+                  }
+              });
+              let gap=|i:usize| ((b.bounds_min[i]-player[i]).max(player[i]-b.bounds_max[i]).max(0) as f64)/65536.;
+              let dist=gap(0).hypot(gap(1));
+              let edge=|t:f64, level:u8| if old>=level {t-4.} else if old!=0 {t+4.} else {t};
+              if dist>=edge(d,8) {8} else if dist>=edge(c,4) {4} else if dist>=edge(a,2) {2} else {1}
+          }
+          pub fn h700_lod(b: &ChunkBuild, step: u8) -> ChunkBuild {
+              use std::collections::{HashMap,HashSet};
+              let mut out=b.clone();
+              if step<=1 {return out;}
+              for slab in &mut out.buffers {
+                  let original=std::mem::take(&mut slab.vertices);
+                  let opaque=std::mem::take(&mut slab.indices);
+                  let water=std::mem::take(&mut slab.indices2);
+                  let mut map=HashMap::<WorldVertex,u32>::new();
+                  let vertices=&mut slab.vertices;
+                  let mut intern=|v:WorldVertex| -> u32 { *map.entry(v).or_insert_with(|| {let i=vertices.len() as u32; vertices.push(v); i}) };
+                  let snap=|mut v:WorldVertex| {
+                      // Preserve the entire perimeter and slab seams. Only interior terrain is clustered.
+                      if v.pos[0]==0 || v.pos[0]>=32 || v.pos[1]==0 || v.pos[1]>=32 || v.pos[2]==0 || v.pos[2]>=249 {return v;}
+                      for i in 0..3 {let n=v.pos[i] as u16; let q=step as u16; let max=if i==2 {248} else {31}; v.pos[i]=(((n+q/2)/q*q).clamp(1,max)) as u8;}
+                      // Keep face normals; reduce colour variations only in interior.
+                      v.color=(v.color & 0xff000000)|(v.color & 0x00f8f8f8); v
+                  };
+                  let mut seen=HashSet::new();
+                  for tri in opaque.chunks_exact(3) {
+                      let vs=[snap(original[tri[0] as usize]),snap(original[tri[1] as usize]),snap(original[tri[2] as usize])];
+                      let a=vs[0].pos; let b=vs[1].pos; let c=vs[2].pos;
+                      let u=[b[0] as i32-a[0] as i32,b[1] as i32-a[1] as i32,b[2] as i32-a[2] as i32];
+                      let v=[c[0] as i32-a[0] as i32,c[1] as i32-a[1] as i32,c[2] as i32-a[2] as i32];
+                      if [u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]==[0;3] {continue;}
+                      let ids=[intern(vs[0]),intern(vs[1]),intern(vs[2])]; let mut key=ids; key.sort_unstable();
+                      if seen.insert(key) {slab.indices.extend_from_slice(&ids);}
+                  }
+                  for i in water {slab.indices2.push(intern(original[i as usize]));}
+              }
+              out.vertex_count=out.buffers.iter().map(|s|s.vertices.len()).sum(); out
+          }
+          """)
+          PY_V6
+      - name: V7 ultra performance
+        run: |
+          python3 - <<'PY_V7'
+          from pathlib import Path
+          
+          def edit(p,a,b,n=1):
+              p=Path(p); s=p.read_text(); assert s.count(a)==n,(str(p),a,s.count(a)); p.write_text(s.replace(a,b))
+          r='crates/cw-client/src/'
+          m='crates/cw-render/src/'
+          # Correct actual body draw distance (V6 only changed effects).
+          edit(r+'controller.rs','cull_distance: self.scene.view_distance * 0.3,','cull_distance: (self.scene.view_distance * 0.3).max(64.0),')
+          edit(r+'controller.rs','height: f(0x78),','height: f(0x78).max(4.0),')
+          # Skip expensive poses already rejected by scene visibility; never skip player.
+          edit(r+'controller.rs','            let st = states.get(&id);\n            let (guard, haste)', '            if id != self.player.id && !body_materials.contains_key(&id) { continue; }\n            let st = states.get(&id);\n            let (guard, haste)')
+          # Exact coplanar model face merge; only safe coordinate and index ranges.
+          edit(m+'mesh.rs','    ModelMesh { vertices, indices }\n}', '''    static MERGE_MODELS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+              if *MERGE_MODELS.get_or_init(|| std::env::var_os("CW_V7_NO_MODEL_MERGE").is_none())
+                  && grid.size.iter().all(|&n| n > 0 && n < 255) && vertices.len() <= 65536 {
+                  let mut slab = ChunkMesh { base_z: 0, vertices, indices: indices.iter().map(|&i| u32::from(i)).collect(), indices2: Vec::new() };
+                  h700_merge(&mut slab);
+                  return ModelMesh { vertices: slab.vertices, indices: slab.indices.into_iter().map(|i| i as u16).collect() };
+              }
+              ModelMesh { vertices, indices }
+          }''')
+          # Limit expensive LOD transitions only; never defer new world data.
+          edit(r+'app.rs','        for (i, (v, b)) in r.chunks.iter().enumerate() {','        let mut lod_budget = 1u32;\n        for (i, (v, b)) in r.chunks.iter().enumerate() {')
+          edit(r+'app.rs','            if old == (*v,lod) { continue; }','            if old == (*v,lod) { continue; }\n            if old.0 == *v && lod > old.1 { if lod_budget == 0 { continue; } lod_budget -= 1; }')
+          # Per-frame GUI bind group cache, safe across texture changes between frames.
+          p=Path(m+'gpu/exec.rs'); s=p.read_text(); a='        let mut fixed_groups: HashMap<(Option<TextureRef>, SamplerState), wgpu::BindGroup> = HashMap::new();'; assert s.count(a)==1
+          s=s.replace(a,a+'\n        let mut gui_groups: HashMap<(Option<TextureRef>, Option<TextureRef>, Option<u32>), wgpu::BindGroup> = HashMap::new();')
+          a=s.index('                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {\n                        label: Some("gui textures")'); b=s.index('                    let kind = if *subtract',a)
+          t=s[a:b].replace('let bg = device.create_bind_group','let bg = gui_groups.entry((*mask, *texture, *mask_surface)).or_insert_with(|| device.create_bind_group').replace('                    });','                    }));'); s=s[:a]+t+s[b:]; s=s.replace('p.set_bind_group(1, &bg, &[]);\n                    p.set_vertex_buffer(0, res.gui_vb','p.set_bind_group(1, &*bg, &[]);\n                    p.set_vertex_buffer(0, res.gui_vb'); p.write_text(s)
+          # Opaque water output; retain water geometry and underwater logic.
+          edit(m+'gpu/shaders/ps03_water.wgsl','saturate(in.texcoord0.w)), 0.85)','saturate(in.texcoord0.w)), 1.0)')
+          # Remove unused FPS assignment, log once a second as before.
+          p=Path(r+'app.rs'); s=p.read_text(); s=s.replace(' let mut fps=0u32;','').replace('{fps=(count as f32','{let fps=(count as f32'); p.write_text(s)
+          # Adaptive whole-frame resolution, opt-in because UI is not yet separately composited.
+          edit(m+'gpu/device.rs','        self.surface.as_ref().unwrap().configure(&self.device, &self.config);\n        self.create_targets();','        if let Some(surface) = &self.surface { surface.configure(&self.device, &self.config); }\n        self.create_targets();')
+          p=Path(r+'app.rs'); s=p.read_text(); a=s.index('pub fn run_mali'); head=s[:a]; t=s[a:]
+          t=t.replace('let (rw,rh) = match','let (mut rw,mut rh) = match',1).replace('    let tex = {','    let mut tex = {',1)
+          t=t.replace('    while !c.quit {','    let adaptive = std::env::var_os("CW_V7_ADAPTIVE").is_some();\n    let max_rw = rw; let mut pending_rw = rw; let mut slow = 0u32; let mut fast = 0u32;\n    while !c.quit {',1)
+          t=t.replace('        let start=Instant::now();','''        let start=Instant::now();
+                  if pending_rw != rw {
+                      rw = pending_rw; rh = rw * 3 / 4;
+                      sink.inner.ctx.resize(rw,rh);
+                      let target = sink.inner.ctx.device.create_texture(&wgpu::TextureDescriptor { label: Some("adaptive frame"), size: wgpu::Extent3d {width:rw,height:rh,depth_or_array_layers:1}, mip_level_count:1,sample_count:1,dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,usage:wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::TEXTURE_BINDING,view_formats:&[] });
+                      tex = { let raw = unsafe { target.as_hal::<wgpu_hal::api::Gles>() }.ok_or("not GLES texture")?; match &raw.inner { wgpu_hal::gles::TextureInner::Texture { raw, .. } => raw.0.get(), _ => return Err("not a GL texture".into()) } };
+                      sink.view = target.create_view(&Default::default()); sink.target = target; sink.width=rw; sink.height=rh;
+                      c.set_back_buffer(rw,rh,rw as f64 / 1280.0);
+                      eprintln!("V7 adaptive target {rw}x{rh}");
+                  }''',1)
+          t=t.replace('eprintln!("FPS {fps}"); count=0;', '''eprintln!("FPS {fps}"); if adaptive { if fps < 24 { slow+=1; fast=0; } else if fps > 33 { fast+=1; slow=0; } else { slow=0; fast=0; } if slow>=3 {pending_rw=rw.saturating_sub(80).max(320); slow=0;} if fast>=6 {pending_rw=(rw+80).min(max_rw); fast=0;} } count=0;''',1)
+          t=t.replace('static ATTACHED: std::sync::OnceLock<()> = std::sync::OnceLock::new();\n        ATTACHED.get_or_init(|| { gl::FramebufferTexture2D(gl::READ_FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,tex,0); assert_eq!(gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE); });','''static ATTACHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                  if ATTACHED.load(std::sync::atomic::Ordering::Relaxed) != tex { gl::FramebufferTexture2D(gl::READ_FRAMEBUFFER,gl::COLOR_ATTACHMENT0,gl::TEXTURE_2D,tex,0); assert_eq!(gl::CheckFramebufferStatus(gl::READ_FRAMEBUFFER),gl::FRAMEBUFFER_COMPLETE); ATTACHED.store(tex,std::sync::atomic::Ordering::Relaxed); }''')
+          p.write_text(head+t)
+          PY_V7
+      - name: V8 GPU instancing
+        run: |
+          python3 - <<'PY_V8'
+          from pathlib import Path
+          p=Path('crates/cw-render/src/gpu/exec.rs'); s=p.read_text()
+          def rep(a,b):
+           global s
+           assert s.count(a)==1,(a,s.count(a)); s=s.replace(a,b)
+          rep('enum Op {','enum Op {')
+          rep('vs: u32, ps: u32, geom: WorldGeom },','vs: u32, ps: u32, geom: WorldGeom, first_instance: u32, instances: u32 },')
+          rep('    world_stream: Stream,','    world_stream: Stream,\n    instance_stream: Stream,')
+          rep('            world_stream: Stream::new','            instance_stream: Stream::new(device, "world instances", wgpu::BufferUsages::VERTEX),\n            world_stream: Stream::new')
+          rep('    pub pipelines: u32,','    pub pipelines: u32,\n    pub instanced_saved: u32,')
+          # 12 vec4 attributes, 192 bytes, locations 2..13; GLES minimum 16 attributes.
+          a='    fn pipeline(&mut self, device:'
+          rep(a,'''    fn instancing() -> bool {
+                  static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                  *ENABLED.get_or_init(|| std::env::var_os("CW_V8_NO_INSTANCING").is_none())
+              }
+          
+          '''+a)
+          rep('        let d = key.depth;\n        let pipeline', '''        let d = key.depth;
+                  let instance_layout = wgpu::VertexBufferLayout {
+                      array_stride: 192,
+                      step_mode: wgpu::VertexStepMode::Instance,
+                      attributes: &wgpu::vertex_attr_array![2=>Float32x4,3=>Float32x4,4=>Float32x4,5=>Float32x4,6=>Float32x4,7=>Float32x4,8=>Float32x4,9=>Float32x4,10=>Float32x4,11=>Float32x4,12=>Float32x4,13=>Float32x4],
+                  };
+                  let instanced = Self::instancing() && matches!(key.program, Program::Shaders { .. });
+                  let buffers = [Some(buffer), Some(instance_layout)];
+                  let pipeline''')
+          rep('                entry_point: Some("vs_main"),\n                compilation_options: Default::default(),\n                buffers: &[Some(buffer)],','                entry_point: Some(if instanced { "vs_instanced" } else { "vs_main" }),\n                compilation_options: Default::default(),\n                buffers: &buffers[..if instanced { 2 } else { 1 }],')
+          rep('        let mut ops: Vec<Op> = Vec::new();','''        let mut ops: Vec<Op> = Vec::new();
+                  let instanced = Self::instancing();
+                  let mut instance_data: Vec<[[f32; 4]; 12]> = Vec::new();
+                  let mut previous_common: Option<(WorldVsConstants, WorldPsConstants)> = None;''')
+          rep('            for draw in &pass.draws {','            previous_common = None;\n            for draw in &pass.draws {')
+          rep('                        let (vs, ps) = world_constants(frame, draw);\n                        let vs = ring.push(&vs);\n                        let ps = ring.push(&ps);\n                        ops.push(Op::World { key, samples, vs, ps, geom });','''                        let (mut vs, ps) = world_constants(frame, draw);
+                                  let first_instance = instance_data.len() as u32;
+                                  if instanced {
+                                      let mut data = [[0.0; 4]; 12];
+                                      data[..4].copy_from_slice(&vs.world_view_proj_matrix);
+                                      data[4..7].copy_from_slice(&vs.world_view_matrix);
+                                      data[7..10].copy_from_slice(&vs.world_matrix);
+                                      data[10] = vs.material_color;
+                                      data[11] = vs.white;
+                                      instance_data.push(data);
+                                      vs.world_view_proj_matrix = [[0.0;4];4];
+                                      vs.world_view_matrix = [[0.0;4];3];
+                                      vs.world_matrix = [[0.0;4];3];
+                                      vs.material_color = [0.0;4];
+                                      vs.white = [0.0;4];
+                                      // Only adjacent identical meshes with identical shared constants/state.
+                                      // Keep original ordering, including transparent geometry.
+                                      if let (WorldGeom::Model(model), Some(Op::World { key: prev_key, samples: prev_samples, geom: WorldGeom::Model(prev_model), first_instance: first, instances, .. })) = (geom, ops.last_mut()) {
+                                          if model == *prev_model && key == *prev_key && samples == *prev_samples && *first + *instances == first_instance && previous_common.as_ref() == Some(&(vs, ps)) && *instances < 256 {
+                                              *instances += 1;
+                                              stats.instanced_saved += 1;
+                                              continue;
+                                          }
+                                      }
+                                      previous_common = Some((vs, ps));
+                                  }
+                                  let vs = ring.push(&vs);
+                                  let ps = ring.push(&ps);
+                                  ops.push(Op::World { key, samples, vs, ps, geom, first_instance, instances: 1 });''')
+          rep('        self.world_stream.upload(device, queue, bytemuck::cast_slice(&world_verts));','        self.world_stream.upload(device, queue, bytemuck::cast_slice(&world_verts));\n        if instanced { self.instance_stream.upload(device, queue, bytemuck::cast_slice(&instance_data)); }')
+          rep('Op::World { key, samples, vs, ps, geom } =>','Op::World { key, samples, vs, ps, geom, first_instance, instances } =>')
+          rep('                    p.set_vertex_buffer(0, vb);','                    p.set_vertex_buffer(0, vb);\n                    if instanced { p.set_vertex_buffer(1, self.instance_stream.buffer.slice(u64::from(*first_instance)*192..u64::from(*first_instance + *instances)*192)); }')
+          rep('p.draw_indexed(0..n, 0, 0..1);','p.draw_indexed(0..n, 0, 0..*instances);')
+          p.write_text(s)
+          p=Path('crates/cw-render/src/gpu/shaders/vs00_world.wgsl'); s=p.read_text(); a='@vertex\nfn vs_main(in: WorldVertexIn) -> WorldVsOut {'; assert s.count(a)==1
+          fields='\n'.join(f'    @location({i+2}) a{i}: vec4<f32>,' for i in range(12))
+          args='vs.worldViewProjMatrix, vs.worldViewMatrix, vs.worldMatrix, vs.materialColor, vs.white'
+          inst='mat4x4<f32>(i.a0,i.a1,i.a2,i.a3), mat3x4<f32>(i.a4,i.a5,i.a6), mat3x4<f32>(i.a7,i.a8,i.a9), i.a10, i.a11'
+          head,body=s.split(a); body=body.replace('vs.worldViewProjMatrix','wvp').replace('vs.worldViewMatrix','wv').replace('vs.worldMatrix','wm').replace('vs.materialColor','material').replace('vs.white','white')
+          s=head+'struct InstanceIn {\n'+fields+'\n}\n\n@vertex\nfn vs_main(in: WorldVertexIn) -> WorldVsOut { return world_vertex(in, '+args+'); }\n\n@vertex\nfn vs_instanced(in: WorldVertexIn, i: InstanceIn) -> WorldVsOut { return world_vertex(in, '+inst+'); }\n\nfn world_vertex(in: WorldVertexIn, wvp: mat4x4<f32>, wv: mat3x4<f32>, wm: mat3x4<f32>, material: vec4<f32>, white: vec4<f32>) -> WorldVsOut {'+body
+          p.write_text(s)
+          p=Path('crates/cw-client/src/app.rs'); s=p.read_text(); s=s.replace('last_stats: (u32,u32,u32)','last_stats: (u32,u32,u32,u32)').replace('last_stats:(0,0,0)','last_stats:(0,0,0,0)').replace('stats.draws,stats.render_passes,stats.skipped)','stats.draws,stats.render_passes,stats.skipped,stats.instanced_saved)').replace('passes={} skipped={}"','passes={} skipped={} instanced_saved={}"').replace('sink.last_stats.2);','sink.last_stats.2,sink.last_stats.3);'); p.write_text(s)
+          PY_V8
+      - name: V9 model LOD and opaque batching
+        run: |
+          python3 - <<'PY_V9'
+          from pathlib import Path
+          p=Path('crates/cw-render/src/gpu/exec.rs'); s=p.read_text()
+          def rep(a,b):
+           global s
+           assert s.count(a)==1,(a,s.count(a)); s=s.replace(a,b)
+          rep('    meshes: HashMap<ModelRef, Option<GpuMesh>>,','    meshes: HashMap<ModelRef, Option<GpuMesh>>,\n    lod_meshes: HashMap<(ModelRef,u8), GpuMesh>,')
+          rep('        self.meshes.insert(id, gpu);','''        self.lod_meshes.retain(|(m,_),_| *m != id);
+                  if mesh.indices.len() >= 192 && std::env::var_os("CW_V9_NO_MODEL_LOD").is_none() && self.lod_meshes.len() < 510 {
+                      for step in [2u8,4] {
+                          if let Some(lod) = crate::mesh::h700_model_lod(mesh, step) {
+                              if let Some(gpu) = upload_mesh(device,"model lod",&lod.vertices,&lod.indices,wgpu::IndexFormat::Uint16) { self.lod_meshes.insert((id,step),gpu); }
+                          }
+                      }
+                  }
+                  self.meshes.insert(id, gpu);''')
+          rep('        self.meshes.remove(&id);','        self.meshes.remove(&id);\n        self.lod_meshes.retain(|(m,_),_| *m != id);')
+          rep('    Model(ModelRef),','    Model(ModelRef,u8),')
+          rep('Geometry::Model { model } => WorldGeom::Model(*model),','''Geometry::Model { model } => {
+                                          let step = if matches!(pass.kind, PassKind::Terrain | PassKind::Objects | PassKind::Creatures | PassKind::FarObjects) {
+                                              let camera = frame.uniforms[draw.uniforms].camera_position;
+                                              let w = draw.draw.world[3];
+                                              let d2 = (w[0]-camera[0]).powi(2)+(w[1]-camera[1]).powi(2)+(w[2]-camera[2]).powi(2);
+                                              if d2 > 48.0*48.0 {4} else if d2 > 24.0*24.0 {2} else {1}
+                                          } else {1};
+                                          WorldGeom::Model(*model,step)
+                                      },''')
+          rep('WorldGeom::Model(model), Some(Op::World { key: prev_key, samples: prev_samples, geom: WorldGeom::Model(prev_model),','WorldGeom::Model(model,lod), Some(Op::World { key: prev_key, samples: prev_samples, geom: WorldGeom::Model(prev_model,prev_lod),')
+          rep('if model == *prev_model && key','if model == *prev_model && lod == *prev_lod && key')
+          rep('WorldGeom::Model(m) => {\n                            let Some(mesh) = res.models.get(m) else {','WorldGeom::Model(m,lod) => {\n                            let Some(mesh) = res.models.lod_meshes.get(&(m,lod)).or_else(|| res.models.get(m)) else {')
+          rep('            for draw in &pass.draws {','''            // Reorder only contiguous opaque depth-writing model runs, never GUI or fades.
+                      let mut ordered: Vec<&Draw> = pass.draws.iter().collect();
+                      if instanced && std::env::var_os("CW_V9_NO_SORT").is_none() && matches!(pass.kind, PassKind::Terrain | PassKind::Objects | PassKind::Creatures) {
+                          let eligible = |d: &Draw| matches!(&d.geometry, Geometry::Model { .. }) && d.draw.alpha == 1.0 && d.state.depth.test && d.state.depth.write && d.state.color_write == 15 && (!d.state.blend.enabled || d.state.blend == BlendState::ALPHA);
+                          let mut i=0;
+                          while i<ordered.len() {
+                              if !eligible(ordered[i]) {i+=1;continue;}
+                              let start=i; while i<ordered.len() && eligible(ordered[i]) {i+=1;}
+                              ordered[start..i].sort_by_key(|d| match &d.geometry { Geometry::Model { model } => (*model,d.uniforms,d.draw.light_set), _=>unreachable!() });
+                          }
+                      }
+                      for draw in ordered {''')
+          # Disable blending only on the water pass, whose V7 shader outputs alpha 1.
+          rep('                        let key = pipeline_key(&draw.state);\n                        let samples = samples_of(current);\n                        if !self.pipeline(device, key, samples) ||','                        let mut key = pipeline_key(&draw.state);\n                        if pass.kind == PassKind::Water && std::env::var_os("CW_V9_NO_OPAQUE_WATER").is_none() { key.blend.enabled=false; }\n                        let samples = samples_of(current);\n                        if !self.pipeline(device, key, samples) ||')
+          p.write_text(s)
+          p=Path('crates/cw-render/src/mesh.rs')
+          with p.open('a') as f: f.write(r'''
+          // Model-local clustering; retain extents and reject empty or ineffective reductions.
+          pub fn h700_model_lod(mesh: &ModelMesh, step: u8) -> Option<ModelMesh> {
+              use std::collections::{HashMap,HashSet};
+              let mut lo=[255u8;3]; let mut hi=[0u8;3];
+              for v in &mesh.vertices { for a in 0..3 {lo[a]=lo[a].min(v.pos[a]);hi[a]=hi[a].max(v.pos[a]);} }
+              let snap=|mut v:WorldVertex| { for a in 0..3 {let n=v.pos[a]; if n!=lo[a] && n!=hi[a] {let q=u16::from(step);v.pos[a]=((u16::from(n)+q/2)/q*q).clamp(u16::from(lo[a]),u16::from(hi[a])) as u8;}} v };
+              let mut out=ModelMesh::default(); let mut map=HashMap::<WorldVertex,u16>::new(); let mut seen=HashSet::new();
+              for t in mesh.indices.chunks_exact(3) {
+                  let vs=[snap(mesh.vertices[t[0] as usize]),snap(mesh.vertices[t[1] as usize]),snap(mesh.vertices[t[2] as usize])];
+                  let a=vs[0].pos;let b=vs[1].pos;let c=vs[2].pos;
+                  let u=std::array::from_fn::<_,3,_>(|i|i32::from(b[i])-i32::from(a[i]));
+                  let v=std::array::from_fn::<_,3,_>(|i|i32::from(c[i])-i32::from(a[i]));
+                  if [u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]]==[0;3] {continue;}
+                  let mut ids=[0u16;3]; for (i,v) in vs.into_iter().enumerate() { if let Some(&id)=map.get(&v) {ids[i]=id;} else {let id=u16::try_from(out.vertices.len()).ok()?;out.vertices.push(v);map.insert(v,id);ids[i]=id;} }
+                  let mut key=ids;key.sort_unstable();if seen.insert(key) {out.indices.extend_from_slice(&ids);}
+              }
+              if out.indices.is_empty() || out.indices.len()*5>=mesh.indices.len()*4 {None} else {Some(out)}
+          }
+          ''')
+          PY_V9
+      - name: V10 background LOD and persistent caches
+        run: |
+          python3 - <<'PY_V10'
+          from pathlib import Path
+          
+          def edit(p,a,b):
+           p=Path(p);s=p.read_text();assert s.count(a)==1,(p,a,s.count(a));p.write_text(s.replace(a,b))
+          a='crates/cw-client/src/app.rs'; e='crates/cw-render/src/gpu/exec.rs'
+          edit(a,'    chunk_versions: Vec<(u64,u8)>,','    chunk_versions: Vec<(u64,u8)>,\n    lod_job: Option<(usize,u64,u8,std::sync::mpsc::Receiver<cw_render::mesh::ChunkBuild>)>,')
+          edit(a,'chunk_versions: Vec::new(),','chunk_versions: Vec::new(), lod_job: None,')
+          edit(a,'chunk_versions:Vec::new(),','chunk_versions:Vec::new(),lod_job:None,')
+          edit(a,'        let mut lod_budget = 1u32;','''        let mut lod_budget = 1u32;
+                  let async_lod = std::env::var_os("CW_V10_SYNC_LOD").is_none();
+                  if let Some((i,v,lod,rx)) = self.lod_job.take() {
+                      match rx.try_recv() {
+                          Ok(mesh) => {
+                              if let Some((version,Some(b))) = r.chunks.get(i) {
+                                  if *version == v && cw_render::mesh::h700_lod_level(b,r.lod_player,self.chunk_versions[i].1) == lod {
+                                      self.res.upload_chunk(dev,i,&mesh);
+                                      self.chunk_versions[i]=(v,lod);
+                                  }
+                              }
+                          },
+                          Err(std::sync::mpsc::TryRecvError::Empty) => self.lod_job=Some((i,v,lod,rx)),
+                          Err(std::sync::mpsc::TryRecvError::Disconnected) => eprintln!("V10 LOD worker disconnected"),
+                      }
+                  }''')
+          edit(a,'            if old == (*v,lod) { continue; }','''            if old == (*v,lod) { continue; }
+                      if async_lod && lod > 1 {
+                          if let Some(b) = b {
+                              // Keep valid full geometry until the worker returns. Never display stale chunks.
+                              if old.0 != *v {
+                                  self.res.upload_chunk(dev,i,b);
+                                  self.chunk_versions[i]=(*v,1);
+                              }
+                              if self.lod_job.is_none() {
+                                  let b=std::sync::Arc::clone(b);
+                                  let (tx,rx)=std::sync::mpsc::sync_channel(1);
+                                  if std::thread::Builder::new().name("h700-lod".into()).spawn(move || {
+                                      let reduced=cw_render::mesh::h700_lod(&b,lod);
+                                      let _=tx.send(reduced);
+                                  }).is_ok() { self.lod_job=Some((i,*v,lod,rx)); }
+                              }
+                              continue;
+                          }
+                      }''')
+          edit(a,'        let mut frame = frame.clone();\n        use cw_render::frame::PassKind;\n        frame.passes.retain(|p| !matches!(p.kind, PassKind::Clouds | PassKind::Shadows | PassKind::Stars | PassKind::Sun | PassKind::Ribbons));\n        s.sync(&frame, &r);','        s.sync(frame, &r);')
+          # executor skips disabled passes only for Mali launcher
+          edit(e,'        for pass in &frame.passes {\n            let t = match pass.target {','''        let h700 = std::env::var_os("CW_V10_MALI").is_some();
+                  for pass in &frame.passes {
+                      if h700 && matches!(pass.kind, PassKind::Clouds | PassKind::Shadows | PassKind::Stars | PassKind::Sun | PassKind::Ribbons) { continue; }
+                      let t = match pass.target {''')
+          # cache GUI bind groups using resource revision; invalidate when texture or surface changes
+          edit(e,'    gui_viewport: Option<(u32, u32)>,','    gui_viewport: Option<(u32, u32)>,\n    gui_revision: u64,')
+          edit(e,'            gui_viewport: None,','            gui_viewport: None,\n            gui_revision: 0,')
+          edit(e,'        self.textures.insert(id, TextureEntry { texture, sampling, sampler });','        self.gui_revision=self.gui_revision.wrapping_add(1);\n        self.textures.insert(id, TextureEntry { texture, sampling, sampler });')
+          edit(e,'        self.textures.remove(&id);','        if self.textures.remove(&id).is_some() { self.gui_revision=self.gui_revision.wrapping_add(1); }')
+          edit(e,'        match self.surfaces.get_mut(&id) {\n            Some(s) => s.resize(device, width, height),','        let changed=match self.surfaces.get_mut(&id) {\n            Some(s) => s.resize(device, width, height),')
+          edit(e,'                true\n            }\n        }\n    }\n\n    /// A render surface.','                true\n            }\n        };\n        if changed { self.gui_revision=self.gui_revision.wrapping_add(1); }\n        changed\n    }\n\n    /// A render surface.')
+          edit(e,'        self.surfaces.remove(&id);','        if self.surfaces.remove(&id).is_some() { self.gui_revision=self.gui_revision.wrapping_add(1); }')
+          edit(e,'    stage0_samplers: HashMap<SamplerState, wgpu::Sampler>,','    stage0_samplers: HashMap<SamplerState, wgpu::Sampler>,\n    gui_groups: HashMap<(Option<TextureRef>,Option<TextureRef>,Option<u32>),wgpu::BindGroup>,\n    gui_revision: u64,')
+          edit(e,'            stage0_samplers: HashMap::new(),','            stage0_samplers: HashMap::new(),\n            gui_groups: HashMap::new(),\n            gui_revision: u64::MAX,')
+          edit(e,'        let mut gui_groups: HashMap<(Option<TextureRef>, Option<TextureRef>, Option<u32>), wgpu::BindGroup> = HashMap::new();','''        if self.gui_revision != res.gui_revision || self.gui_groups.len()>256 || std::env::var_os("CW_V10_NO_GUI_CACHE").is_some() {
+                      self.gui_groups.clear(); self.gui_revision=res.gui_revision;
+                  }
+                  let mut gui_groups=std::mem::take(&mut self.gui_groups);''')
+          edit(e,'        drop(pass);\n        stats.pipelines = self.cache.len() as u32;','        drop(pass);\n        if gui_groups.len()<=256 { self.gui_groups=gui_groups; }\n        stats.pipelines = self.cache.len() as u32;')
+          # Keep allocated CPU scratch storage across frames; cap retained capacity.
+          edit(e,'    gui_revision: u64,\n    white: GpuTexture,','    gui_revision: u64,\n    scratch_uniforms: Vec<u8>,\n    scratch_instances: Vec<[[f32;4];12]>,\n    white: GpuTexture,')
+          edit(e,'            gui_revision: u64::MAX,','            gui_revision: u64::MAX,\n            scratch_uniforms: Vec::new(),\n            scratch_instances: Vec::new(),')
+          edit(e,'let mut ring = Ring { data: Vec::new(), align: self.align as usize };','let mut ring = Ring { data: std::mem::take(&mut self.scratch_uniforms), align: self.align as usize };\n        ring.data.clear();')
+          edit(e,'let mut instance_data: Vec<[[f32; 4]; 12]> = Vec::new();','let mut instance_data=std::mem::take(&mut self.scratch_instances);\n        instance_data.clear();')
+          edit(e,'        stats.pipelines = self.cache.len() as u32;','        if ring.data.capacity()<=8*1024*1024 { self.scratch_uniforms=ring.data; }\n        if instance_data.capacity()<=32768 { self.scratch_instances=instance_data; }\n        stats.pipelines = self.cache.len() as u32;')
+          PY_V10
+      - name: Build ARM64
+        env:
+          RUSTFLAGS: '-C target-cpu=cortex-a53'
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '1'
+        run: cargo build --release -p cw-client -p cw-server
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/cw-client dist/cw-client-mali-v10
+          cp target/release/cw-server dist/cw-server
+          file dist/*
+          (cd dist && sha256sum cw-client-mali-v10 cw-server > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CubeWorld-Mali-Native-H700-V10
+          path: dist/
+          if-no-files-found: error
